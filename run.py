@@ -50,7 +50,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional, Tuple
+
+from douban_crawler.transport.proxy_pool import MockProxyPool, ProxyEndpoint, build_mock_proxy_pool
 
 try:
     import anyio
@@ -105,7 +107,34 @@ def _build_default_mcp_args() -> str:
     return " ".join(parts)
 
 
+def _load_proxy_pool_config() -> str:
+    raw = os.environ.get("DOUBAN_PROXY_POOL", "")
+    if raw.strip():
+        return raw
+
+    configured_path = os.environ.get("DOUBAN_PROXY_POOL_FILE", "").strip()
+    proxy_pool_path = Path(configured_path) if configured_path else DATA_DIR / "mock_proxy_pool.json"
+    if not proxy_pool_path.is_absolute():
+        proxy_pool_path = PROJECT_ROOT / proxy_pool_path
+
+    try:
+        if proxy_pool_path.exists():
+            return proxy_pool_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return ""
+
+
 FETCH_BACKEND = os.environ.get("DOUBAN_FETCH_BACKEND", "mcp").strip().lower() or "mcp"
+PROXY_POOL_MODE = os.environ.get("DOUBAN_PROXY_POOL_MODE", "off").strip().lower() or "off"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "douban_group.db"
+
+PROXY_POOL_CONFIG = _load_proxy_pool_config()
+PROXY_MAX_FAILURES = int(os.environ.get("DOUBAN_PROXY_MAX_FAILURES", "2"))
+PROXY_ANTIBOT_THRESHOLD = 2
 DOUBAN_COOKIE_RAW = os.environ.get("DOUBAN_COOKIE", "")
 DOUBAN_COOKIE_ENV = DOUBAN_COOKIE_RAW or (
     'bid=qExCrbdUTM8; ll="108288"; _pk_id.100001.8cb4=3ea132d009284f2a.1775486888.;'
@@ -125,11 +154,6 @@ DOUBAN_MCP_NAV_TIMEOUT = float(os.environ.get("DOUBAN_MCP_NAV_TIMEOUT", "45"))
 DOUBAN_MCP_READY_TIMEOUT = float(os.environ.get("DOUBAN_MCP_READY_TIMEOUT", "20"))
 DOUBAN_MCP_STABILIZE_DELAY = float(os.environ.get("DOUBAN_MCP_STABILIZE_DELAY", "1.0"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "douban_group.db"
 
 logger = logging.getLogger("douban_crawler")
 
@@ -273,8 +297,30 @@ class HttpClient:
         self._ssl_ctx = ssl.create_default_context()
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
+        self._opener_cache: dict[str, urllib.request.OpenerDirector] = {}
 
-    def get(self, url: str, referer: str | None = None) -> tuple[int, str]:
+    def _get_opener(self, proxy_url: str | None = None) -> urllib.request.OpenerDirector:
+        normalized_proxy = (proxy_url or "").strip()
+        if normalized_proxy in self._opener_cache:
+            return self._opener_cache[normalized_proxy]
+
+        handlers: list[object] = [
+            urllib.request.HTTPHandler(),
+            urllib.request.HTTPSHandler(context=self._ssl_ctx),
+        ]
+        if normalized_proxy:
+            parsed = urllib.parse.urlparse(normalized_proxy)
+            if parsed.scheme not in {"http", "https"}:
+                raise ValueError(
+                    f"不支持的代理协议: {parsed.scheme or '<empty>'}；run.py 当前仅支持 http/https 代理 URL"
+                )
+            handlers.insert(0, urllib.request.ProxyHandler({"http": normalized_proxy, "https": normalized_proxy}))
+
+        opener = urllib.request.build_opener(*handlers)
+        self._opener_cache[normalized_proxy] = opener
+        return opener
+
+    def get(self, url: str, referer: str | None = None, proxy_url: str | None = None) -> tuple[int, str]:
         """发起 GET 请求，返回 (status_code, body_text)"""
         headers = {
             "User-Agent": self._ua,
@@ -295,7 +341,8 @@ class HttpClient:
 
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=self._ssl_ctx)
+            opener = self._get_opener(proxy_url)
+            resp = opener.open(req, timeout=REQUEST_TIMEOUT)
             data = resp.read()
             if resp.headers.get("Content-Encoding") == "gzip":
                 data = gzip.decompress(data)
@@ -322,42 +369,255 @@ def fetch_with_retry(
     client: HttpClient,
     url: str,
     referer: str | None = None,
+    proxy_url: str | None = None,
     max_retries: int = MAX_RETRIES,
-) -> str | None:
-    """带指数退避重试的页面获取，成功返回 HTML 文本，失败返回 None"""
+    retry_limit_overrides: dict[int, int] | None = None,
+    exception_retry_limit: int | None = None,
+    raise_on_exception_exhausted: bool = False,
+    request_label: str = "",
+) -> tuple[int, str] | None:
+    """带指数退避重试的页面获取，成功返回 (status, body)，失败返回 None。"""
     retryable = {403, 429, 500, 502, 503, 504}
+    status_attempts: dict[int, int] = {}
+    exception_attempts = 0
+    prefix = f"{request_label} " if request_label else ""
     for attempt in range(1, max_retries + 1):
         try:
-            status, body = client.get(url, referer=referer)
+            status, body = client.get(url, referer=referer, proxy_url=proxy_url)
             if status == 200:
-                return body
+                return status, body
             if status in retryable:
+                status_attempts[status] = status_attempts.get(status, 0) + 1
+                limit = (retry_limit_overrides or {}).get(status, max_retries)
+                current_attempt = status_attempts[status]
+                if current_attempt >= limit:
+                    logger.warning(f"{prefix}HTTP {status}，已达到 {current_attempt}/{limit} 次失败，交给上层决定是否切换代理")
+                    return status, body
                 delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 2)
-                logger.warning(f"HTTP {status}，第 {attempt}/{max_retries} 次重试，等待 {delay:.1f}s")
+                logger.warning(f"{prefix}HTTP {status}，第 {current_attempt}/{limit} 次重试，等待 {delay:.1f}s")
                 time.sleep(delay)
                 continue
-            logger.error(f"HTTP {status}，不可重试")
-            return None
+            logger.error(f"{prefix}HTTP {status}，不可重试")
+            return status, body
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            exception_attempts += 1
+            limit = exception_retry_limit or max_retries
+            if exception_attempts >= limit:
+                logger.warning(
+                    f"{prefix}请求异常 {type(exc).__name__}，已达到 {exception_attempts}/{limit} 次失败，交给上层决定是否切换代理"
+                )
+                if raise_on_exception_exhausted:
+                    raise
+                return None
             delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 2)
-            logger.warning(f"请求异常 {type(exc).__name__}，第 {attempt}/{max_retries} 次重试，等待 {delay:.1f}s")
+            logger.warning(f"{prefix}请求异常 {type(exc).__name__}，第 {exception_attempts}/{limit} 次重试，等待 {delay:.1f}s")
             time.sleep(delay)
-    logger.error(f"达到最大重试次数 {max_retries}，放弃: {url}")
+    logger.error(f"{prefix}达到最大重试次数 {max_retries}，放弃: {url}")
     return None
 
 
+RunPyRequestExecutor = Callable[
+    [HttpClient, str, Optional[str], Optional[ProxyEndpoint]],
+    Optional[Tuple[int, str]],
+]
+
+
+class RouteFailure(RuntimeError):
+    """供测试注入的明确路由失败信号。"""
+
+    def __init__(self, message: str, *, definitive: bool = False) -> None:
+        super().__init__(message)
+        self.definitive = definitive
+
+
+def _resolve_endpoint_proxy_url(endpoint: ProxyEndpoint | None) -> str:
+    if not endpoint:
+        return ""
+    return (endpoint.proxy_url or endpoint.metadata.get("proxy_url") or "").strip()
+
+
+def _detect_antibot_block_reason(body: str) -> str | None:
+    if "检测到有异常请求" in body or "异常请求" in body:
+        return "命中豆瓣反爬机制拦截页"
+    return None
+
+
+def _clear_endpoint_antibot_counter(endpoint: ProxyEndpoint) -> None:
+    endpoint.metadata["consecutive_antibot_blocks"] = "0"
+
+
+def _mark_endpoint_antibot_block(endpoint: ProxyEndpoint) -> int:
+    current = int(endpoint.metadata.get("consecutive_antibot_blocks", "0") or "0")
+    current += 1
+    endpoint.metadata["consecutive_antibot_blocks"] = str(current)
+    return current
+
+
+def _available_proxy_count(pool: MockProxyPool, attempted: set[str]) -> int:
+    return pool.available_count(exclude=attempted)
+
+
+def _log_proxy_switch_notice(
+    endpoint: ProxyEndpoint,
+    reason: str,
+    *,
+    pool: MockProxyPool,
+    attempted: set[str],
+    disabled: bool,
+) -> None:
+    remaining = _available_proxy_count(pool, attempted)
+    status_text = "该节点已失效" if disabled else "该节点暂不可用"
+    if remaining > 0:
+        logger.info(
+            f"[代理切换] 节点 {endpoint.name} 因 {reason} 需要切换，{status_text}；剩余可尝试节点 {remaining} 个"
+        )
+    else:
+        logger.warning(
+            f"[代理切换] 节点 {endpoint.name} 因 {reason} 需要切换，但已经没有其他可用代理节点"
+        )
+
+
 class HttpPageFetcher:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        proxy_pool: MockProxyPool | None = None,
+        request_executor: RunPyRequestExecutor | None = None,
+    ) -> None:
         self._client = HttpClient()
+        self._proxy_pool = proxy_pool
+        self._request_executor = request_executor or self._execute_request
 
     def fetch(self, url: str, referer: str | None = None) -> str | None:
-        return fetch_with_retry(self._client, url, referer=referer)
+        if not self._proxy_pool:
+            result = self._request_executor(self._client, url, referer, None)
+            if result and result[0] == 200:
+                return result[1]
+            return None
+
+        attempted: set[str] = set()
+        last_reason = "未开始请求"
+        previous_endpoint_name = ""
+        while True:
+            endpoint = self._proxy_pool.acquire(exclude=attempted)
+            if endpoint is None:
+                logger.error(f"[代理池耗尽] 没有可用节点，放弃抓取: {url} | 最后失败: {last_reason}")
+                return None
+
+            attempted.add(endpoint.name)
+            if previous_endpoint_name:
+                logger.info(f"[代理切换] 已切换代理: {previous_endpoint_name} -> {endpoint.name}")
+            else:
+                logger.info(f"[代理] 当前使用节点: {endpoint.name}")
+            previous_endpoint_name = endpoint.name
+            try:
+                result = self._request_executor(self._client, url, referer, endpoint)
+            except Exception as exc:
+                _clear_endpoint_antibot_counter(endpoint)
+                last_reason = str(exc) or type(exc).__name__
+                disabled = self._proxy_pool.report_failure(
+                    endpoint,
+                    last_reason,
+                    definitive=_is_definitive_route_error(exc),
+                )
+                suffix = "，已标记失效" if disabled else ""
+                logger.warning(f"[代理异常] 节点 {endpoint.name} 请求异常: {last_reason}{suffix}")
+                _log_proxy_switch_notice(
+                    endpoint,
+                    last_reason,
+                    pool=self._proxy_pool,
+                    attempted=attempted,
+                    disabled=disabled,
+                )
+                continue
+
+            if result and result[0] == 200:
+                block_reason = _detect_antibot_block_reason(result[1])
+                if block_reason:
+                    block_count = _mark_endpoint_antibot_block(endpoint)
+                    last_reason = f"{block_reason} (连续 {block_count} 次)"
+                    disabled = self._proxy_pool.report_failure(
+                        endpoint,
+                        last_reason,
+                        definitive=block_count >= PROXY_ANTIBOT_THRESHOLD,
+                    )
+                    suffix = "，已标记失效" if disabled else ""
+                    logger.warning(
+                        f"[反爬拦截] 节点 {endpoint.name} 命中反爬页: {last_reason}{suffix}"
+                    )
+                    _log_proxy_switch_notice(
+                        endpoint,
+                        last_reason,
+                        pool=self._proxy_pool,
+                        attempted=attempted,
+                        disabled=disabled,
+                    )
+                    continue
+
+                _clear_endpoint_antibot_counter(endpoint)
+                self._proxy_pool.report_success(endpoint)
+                return result[1]
+
+            status = result[0] if result else 0
+            if result is not None and not _should_failover_status(status):
+                logger.error(f"HTTP {status}，当前请求不触发 failover")
+                return None
+
+            _clear_endpoint_antibot_counter(endpoint)
+            last_reason = f"HTTP {status}" if result is not None else "空响应"
+            disabled = self._proxy_pool.report_failure(
+                endpoint,
+                last_reason,
+                definitive=result is not None and status == 407,
+            )
+            suffix = "，已标记失效" if disabled else ""
+            logger.warning(f"[代理失败] 节点 {endpoint.name} 失败: {last_reason}{suffix}")
+            _log_proxy_switch_notice(
+                endpoint,
+                last_reason,
+                pool=self._proxy_pool,
+                attempted=attempted,
+                disabled=disabled,
+            )
 
     def rotate(self) -> None:
         self._client.rotate()
 
     def close(self) -> None:
         self._client.close()
+
+    def _execute_request(
+        self,
+        client: HttpClient,
+        url: str,
+        referer: str | None,
+        endpoint: ProxyEndpoint | None,
+    ) -> tuple[int, str] | None:
+        if endpoint:
+            proxy_url = _resolve_endpoint_proxy_url(endpoint)
+            if proxy_url:
+                logger.debug(f"通过代理节点 {endpoint.name} 发起请求: {proxy_url}")
+            else:
+                logger.debug(f"代理节点 {endpoint.name} 未配置 proxy_url，当前请求仍走直连")
+            retry_limit_overrides = {403: 2}
+            exception_retry_limit = 2
+            raise_on_exception_exhausted = True
+            request_label = f"[{endpoint.name}]"
+        else:
+            proxy_url = ""
+            retry_limit_overrides = None
+            exception_retry_limit = None
+            raise_on_exception_exhausted = False
+            request_label = ""
+        return fetch_with_retry(
+            client,
+            url,
+            referer=referer,
+            proxy_url=proxy_url or None,
+            retry_limit_overrides=retry_limit_overrides,
+            exception_retry_limit=exception_retry_limit,
+            raise_on_exception_exhausted=raise_on_exception_exhausted,
+            request_label=request_label,
+        )
 
 
 class ChromeMcpPageFetcher:
@@ -633,8 +893,73 @@ def create_page_fetcher(
     if backend == "mcp":
         return ChromeMcpPageFetcher(mcp_args=mcp_args)
     if backend == "http":
-        return HttpPageFetcher()
+        return HttpPageFetcher(proxy_pool=_load_mock_proxy_pool())
     raise ValueError(f"不支持的页面访问后端: {backend}")
+
+
+def _should_failover_status(status_code: int) -> bool:
+    return status_code in {403, 407, 502, 503, 504}
+
+
+def _is_definitive_route_error(exc: Exception) -> bool:
+    if isinstance(exc, RouteFailure):
+        return exc.definitive
+    return isinstance(exc, (urllib.error.URLError, OSError, TimeoutError))
+
+
+def _count_routable_proxies(pool: MockProxyPool | None) -> int:
+    if not pool:
+        return 0
+    return sum(1 for endpoint in pool.snapshot() if endpoint["proxy_url"])
+
+
+def _load_mock_proxy_pool() -> MockProxyPool | None:
+    if not PROXY_POOL_CONFIG.strip():
+        return None
+    try:
+        pool = build_mock_proxy_pool(PROXY_POOL_CONFIG, max_failures=PROXY_MAX_FAILURES)
+    except ValueError as exc:
+        logger.error(f"mock 代理池配置无效: {exc}")
+        return None
+    if not pool:
+        if PROXY_POOL_MODE == "mock":
+            logger.warning("DOUBAN_PROXY_POOL_MODE=mock 但未提供可用节点，已忽略")
+        return None
+
+    total = len(pool.snapshot())
+    routable = _count_routable_proxies(pool)
+    if PROXY_POOL_MODE == "mock":
+        logger.info(f"已启用代理池，共 {total} 个节点，其中 {routable} 个配置了 proxy_url")
+        if routable == 0:
+            logger.warning("当前节点均未配置 proxy_url；只会做本地切换模拟，不会改变真实网络出口")
+        return pool
+
+    if routable > 0:
+        logger.info(f"检测到 {routable}/{total} 个节点配置了 proxy_url，HTTP 后端已自动启用代理池")
+        return pool
+
+    logger.warning("检测到代理节点配置，但当前节点均未配置 proxy_url，且 DOUBAN_PROXY_POOL_MODE != mock；本次不会启用代理切换")
+    return None
+
+
+def get_proxy_runtime_status() -> tuple[bool, str, int, int]:
+    if not PROXY_POOL_CONFIG.strip():
+        return False, "未配置代理节点", 0, 0
+    try:
+        pool = build_mock_proxy_pool(PROXY_POOL_CONFIG, max_failures=PROXY_MAX_FAILURES)
+    except ValueError as exc:
+        return False, f"代理配置无效: {exc}", 0, 0
+    if not pool:
+        return False, "代理配置为空", 0, 0
+    total = len(pool.snapshot())
+    routable = _count_routable_proxies(pool)
+    if PROXY_POOL_MODE == "mock":
+        if routable > 0:
+            return True, "已显式启用代理池", total, routable
+        return True, "已显式启用代理池，但当前仅做本地切换模拟", total, routable
+    if routable > 0:
+        return True, "检测到可路由 proxy_url，已自动启用代理池", total, routable
+    return False, "仅有 vmess 元数据、没有 proxy_url，无法切换真实代理", total, routable
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -671,9 +996,27 @@ def _strip_tags(html_str: str) -> str:
 
 def _check_blocked(body: str) -> None:
     if "检测到有异常请求" in body or "异常请求" in body:
-        logger.error("被豆瓣反爬机制拦截！建议：增大请求间隔 / 更换 IP / 设置 DOUBAN_COOKIE")
+        runtime_enabled, runtime_reason, _, _ = get_proxy_runtime_status()
+        if runtime_enabled:
+            logger.error("[反爬拦截] 当前响应被豆瓣反爬机制拦截；若代理池仍有节点，将继续尝试切换代理")
+        else:
+            logger.error(f"[反爬拦截] 当前响应被豆瓣反爬机制拦截；当前不会触发代理切换: {runtime_reason}")
     elif re.search(r"<title>[^<]*(登录|登录跳转)[^<]*</title>", body) and "豆瓣" in body:
         logger.warning("当前命中登录跳转页；优先连接已登录的 Chrome，必要时再补 DOUBAN_COOKIE")
+
+
+class ListPageUnavailableError(RuntimeError):
+    """讨论列表首页不可用，无法继续分页。"""
+
+
+def _detect_list_page_issue(body: str) -> str | None:
+    if "检测到有异常请求" in body or "异常请求" in body:
+        return "当前请求命中豆瓣异常请求/反爬页面，无法判断总页数"
+    if re.search(r"<title>[^<]*(登录|登录跳转)[^<]*</title>", body) and "豆瓣" in body:
+        return "当前命中豆瓣登录跳转页，无法判断总页数；请优先连接已登录的 Chrome，或补充有效 DOUBAN_COOKIE"
+    if not re.search(r'<table[^>]*class="[^"]*\bolt\b[^"]*"[^>]*>', body, re.S):
+        return "首页未找到讨论列表表格 (.olt)，无法判断总页数；可能被反爬拦截或页面结构已变化"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +1114,10 @@ def parse_topic_list(body: str, group_id: str, tab_id: str = "") -> list[Topic]:
 
 def parse_total_pages(body: str) -> int:
     """从列表页解析总页数"""
+    issue = _detect_list_page_issue(body)
+    if issue:
+        raise ListPageUnavailableError(issue)
+
     m = re.search(r'data-total-page="(\d+)"', body)
     if m:
         return int(m.group(1))
@@ -1054,6 +1401,7 @@ class DoubanGroupCrawler:
         fetch_details: bool = False, fetch_comments: bool = False,
         fetch_backend: str = FETCH_BACKEND,
         mcp_args: str | None = None,
+        fetcher_factory: Callable[[str, str | None], HttpPageFetcher | ChromeMcpPageFetcher] | None = None,
     ) -> None:
         self.group_id = group_id
         self.tab_id = tab_id
@@ -1064,7 +1412,8 @@ class DoubanGroupCrawler:
         self.fetch_comments = fetch_comments
         self.fetch_backend = fetch_backend
         self.mcp_args = mcp_args
-        self._fetcher = create_page_fetcher(fetch_backend, mcp_args=mcp_args)
+        self._fetcher_factory = fetcher_factory or create_page_fetcher
+        self._fetcher = self._fetcher_factory(fetch_backend, mcp_args)
         self._limiter = RateLimiter()
         self.stats: dict[str, int] = {
             "pages_fetched": 0, "pages_skipped": 0, "topics_found": 0, "topics_new": 0,
@@ -1104,7 +1453,13 @@ class DoubanGroupCrawler:
             logger.error("无法获取第一页")
             return all_topics
 
-        total = parse_total_pages(first_html)
+        try:
+            total = parse_total_pages(first_html)
+        except ListPageUnavailableError as exc:
+            logger.error(f"第一页不是可用的讨论列表页：{exc}")
+            self.stats["errors"] += 1
+            return all_topics
+
         start_page = self.skip_pages + 1
         if start_page > total:
             self.stats["pages_skipped"] = total
@@ -1267,6 +1622,79 @@ def print_stats(group_id: str) -> None:
     print(f"{'=' * 42}\n")
 
 
+def print_proxy_status() -> None:
+    runtime_enabled, runtime_reason, total_nodes, routable_nodes = get_proxy_runtime_status()
+    print(f"\n{'=' * 64}")
+    print("  当前代理配置")
+    print(f"{'=' * 64}")
+    print(f"  代理池模式: {PROXY_POOL_MODE}")
+    print(f"  最大连续失败阈值: {PROXY_MAX_FAILURES}")
+    print(f"  运行时是否启用: {'是' if runtime_enabled else '否'}")
+    print(f"  运行时说明: {runtime_reason}")
+
+    if not PROXY_POOL_CONFIG.strip():
+        print("  状态: 未配置 DOUBAN_PROXY_POOL，且未找到本地 mock_proxy_pool.json")
+        print(f"{'=' * 64}\n")
+        return
+
+    try:
+        pool = build_mock_proxy_pool(PROXY_POOL_CONFIG, max_failures=PROXY_MAX_FAILURES)
+    except ValueError as exc:
+        print(f"  状态: 配置无效: {exc}")
+        print(f"{'=' * 64}\n")
+        return
+
+    if not pool:
+        print("  状态: 已提供配置，但未解析出任何代理节点")
+        print(f"{'=' * 64}\n")
+        return
+
+    snapshot = pool.snapshot()
+    print(f"  已解析节点数: {len(snapshot)}")
+    print(f"  可真实路由节点数: {routable_nodes}/{total_nodes}")
+    if not runtime_enabled:
+        print("  说明: 当前不会发生真实代理切换；以下仅展示已配置节点元信息")
+    print("  说明: 纯 vmess 元数据不会自动变成可连接代理，必须额外提供 proxy_url")
+    print(f"{'=' * 64}")
+
+    for index, endpoint in enumerate(snapshot, start=1):
+        metadata = endpoint["metadata"]
+        pool_status = "disabled" if endpoint["disabled"] else "available"
+        advertised_connectable = metadata.get("connectable", "unknown")
+        host = metadata.get("server_host") or "-"
+        port = metadata.get("server_port") or "-"
+        network = metadata.get("network") or "-"
+        host_header = metadata.get("host_header") or "-"
+        path = metadata.get("path") or "-"
+        tls = metadata.get("tls") or "-"
+        source = metadata.get("mock_source") or ("proxy_url" if endpoint["proxy_url"] else "plain")
+        antibot_blocks = metadata.get("consecutive_antibot_blocks", "0")
+
+        print(f"[{index:02d}] {endpoint['name']}")
+        print(f"  pool_status: {pool_status}")
+        print(f"  advertised_connectable: {advertised_connectable}")
+        print(f"  successes/failures: {endpoint['total_successes']}/{endpoint['total_failures']}")
+        print(f"  consecutive_failures: {endpoint['consecutive_failures']}")
+        print(f"  consecutive_antibot_blocks: {antibot_blocks}")
+        print(f"  source: {source}")
+        if endpoint["proxy_url"]:
+            print(f"  proxy_url: {endpoint['proxy_url']}")
+        print(f"  server: {host}:{port}")
+        print(f"  network: {network}")
+        print(f"  host_header: {host_header}")
+        print(f"  path: {path}")
+        print(f"  tls: {tls}")
+        if metadata.get("type"):
+            print(f"  type: {metadata['type']}")
+        if metadata.get("uuid"):
+            print(f"  uuid: {metadata['uuid']}")
+        if endpoint["last_error"]:
+            print(f"  last_error: {endpoint['last_error']}")
+        print()
+
+    print(f"{'=' * 64}\n")
+
+
 def do_export(group_id: str, fmt: str, output: str | None) -> None:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -1337,6 +1765,7 @@ def main() -> None:
   python3 run.py -p 0                       全部页
   python3 run.py -g 12345 -t 99999          指定小组和 tab
   python3 run.py --stats                    数据库统计
+  python3 run.py --proxy-status             查看当前代理配置与状态
   python3 run.py --export csv               导出 CSV
   python3 run.py --export json -o out.json  导出 JSON
 
@@ -1361,6 +1790,7 @@ def main() -> None:
     ap.add_argument("--details", action="store_true", help="爬取帖子详情与评论")
     ap.add_argument("--no-comments", action="store_true", help="不爬评论（需配合 --details）")
     ap.add_argument("--stats", action="store_true", help="查看数据库统计")
+    ap.add_argument("--proxy-status", action="store_true", help="查看当前代理配置、元信息与本地状态")
     ap.add_argument("--export", choices=["csv", "json"], help="导出数据")
     ap.add_argument("-o", "--output", help="导出文件路径")
     ap.add_argument("--debug", action="store_true", help="调试日志")
@@ -1376,6 +1806,9 @@ def main() -> None:
 
     if args.stats:
         print_stats(args.group)
+        return
+    if args.proxy_status:
+        print_proxy_status()
         return
     if args.export:
         do_export(args.group, args.export, args.output)
@@ -1402,6 +1835,12 @@ def main() -> None:
     print(f"{'=' * 48}")
     print(f"  目标: {target_url}")
     print(f"  后端: {args.backend}")
+    if args.backend == "http":
+        proxy_enabled, proxy_reason, proxy_total, proxy_routable = get_proxy_runtime_status()
+        print(f"  代理池: {'启用' if proxy_enabled else '未启用'}")
+        print(f"  代理说明: {proxy_reason}")
+        if proxy_total:
+            print(f"  代理节点: {proxy_total}（可路由 {proxy_routable}）")
     if args.backend == "mcp":
         if args.mcp_browser_url:
             print(f"  MCP连接: 现有浏览器 {args.mcp_browser_url}")

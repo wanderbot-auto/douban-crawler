@@ -10,7 +10,7 @@ from typing import Any, Callable
 import httpx
 try:
     from fake_useragent import UserAgent
-except ImportError:
+except Exception:
     UserAgent = None
 
 from douban_crawler.config import (
@@ -213,6 +213,7 @@ def create_client() -> httpx.Client:
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
         http2=False,
+        trust_env=False,
     )
     logger.debug(f"创建 HTTP 客户端 | UA: {ua[:60]}... | bid: {cookies.get('bid', 'N/A')}")
     return client

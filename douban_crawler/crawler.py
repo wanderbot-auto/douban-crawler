@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 from urllib.parse import urljoin
 
 from douban_crawler.anti_crawl import RateLimiter
@@ -11,6 +12,7 @@ from douban_crawler.fetcher import PageFetcher, create_page_fetcher
 from douban_crawler.models import Comment, Topic
 from douban_crawler.parser import (
     has_next_comment_page,
+    ListPageUnavailableError,
     parse_comments,
     parse_topic_detail,
     parse_topic_list,
@@ -39,6 +41,7 @@ class DoubanGroupCrawler:
         fetch_details: bool = True,
         fetch_comments: bool = True,
         fetch_backend: str = FETCH_BACKEND,
+        fetcher_factory: Callable[[str], PageFetcher] | None = None,
     ) -> None:
         self.group_id = group_id
         self.storage = storage or Storage()
@@ -47,6 +50,7 @@ class DoubanGroupCrawler:
         self.fetch_details = fetch_details
         self.fetch_comments = fetch_comments
         self.fetch_backend = fetch_backend
+        self._fetcher_factory = fetcher_factory or create_page_fetcher
 
         self._fetcher: PageFetcher | None = None
         self._rate_limiter = RateLimiter()
@@ -74,7 +78,7 @@ class DoubanGroupCrawler:
         )
 
         try:
-            self._fetcher = create_page_fetcher(self.fetch_backend)
+            self._fetcher = self._fetcher_factory(self.fetch_backend)
 
             all_topics = self._crawl_topic_list()
             if self.fetch_details and all_topics:
@@ -103,7 +107,13 @@ class DoubanGroupCrawler:
             logger.error("无法获取第一页，终止爬取")
             return all_topics
 
-        total_pages = parse_total_pages(first_page_html)
+        try:
+            total_pages = parse_total_pages(first_page_html)
+        except ListPageUnavailableError as exc:
+            logger.error("第一页不是可用的讨论列表页：%s", exc)
+            self.stats["errors"] += 1
+            return all_topics
+
         start_page = self.skip_pages + 1
         if start_page > total_pages:
             self.stats["pages_skipped"] = total_pages

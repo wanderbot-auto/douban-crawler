@@ -13,6 +13,10 @@ from douban_crawler.models import Topic, TopicDetail, Comment
 logger = logging.getLogger(__name__)
 
 
+class ListPageUnavailableError(RuntimeError):
+    """讨论列表首页不可用，无法继续分页。"""
+
+
 def parse_topic_list(html: str, group_id: str) -> list[Topic]:
     """解析小组讨论列表页，返回帖子列表
 
@@ -246,6 +250,9 @@ def parse_total_pages(html: str) -> int:
     分页结构: <div class="paginator"> ... <span class="thispage" data-total-page="N"> ... </div>
     """
     soup = BeautifulSoup(html, "lxml")
+    issue = _detect_list_page_issue(soup)
+    if issue:
+        raise ListPageUnavailableError(issue)
 
     # 方式1: data-total-page 属性
     this_page = soup.select_one(".paginator .thispage")
@@ -309,3 +316,16 @@ def _check_blocked(soup: BeautifulSoup) -> None:
         logger.error("🚫 被豆瓣反爬机制拦截！建议：增大请求间隔 / 更换 IP / 设置登录 Cookie")
     elif "登录" in title and "豆瓣" in title:
         logger.warning("⚠️ 当前命中登录跳转页；优先连接已登录的 Chrome，必要时再补 DOUBAN_COOKIE")
+
+
+def _detect_list_page_issue(soup: BeautifulSoup) -> str | None:
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    page_text = str(soup)
+
+    if "检测到有异常请求" in title or "异常请求" in page_text:
+        return "当前请求命中豆瓣异常请求/反爬页面，无法判断总页数"
+    if "登录" in title and "豆瓣" in title:
+        return "当前命中豆瓣登录跳转页，无法判断总页数；请优先连接已登录的 Chrome，或补充有效 DOUBAN_COOKIE"
+    if not soup.find("table", class_="olt"):
+        return "首页未找到讨论列表表格 (.olt)，无法判断总页数；可能被反爬拦截或页面结构已变化"
+    return None

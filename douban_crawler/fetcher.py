@@ -11,11 +11,16 @@ import shlex
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Protocol
+from typing import Callable, Protocol
 
 import httpx
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+except ImportError:  # 仅在 mcp 后端运行时才需要
+    ClientSession = None
+    StdioServerParameters = None
+    stdio_client = None
 
 from douban_crawler.anti_crawl import create_client, generate_bid, random_user_agent, retry_on_failure
 from douban_crawler.config import (
@@ -27,7 +32,11 @@ from douban_crawler.config import (
     DOUBAN_MCP_READY_TIMEOUT,
     DOUBAN_MCP_STABILIZE_DELAY,
     DOUBAN_MCP_STARTUP_TIMEOUT,
+    PROXY_MAX_FAILURES,
+    PROXY_POOL_CONFIG,
+    PROXY_POOL_MODE,
 )
+from douban_crawler.transport.proxy_pool import MockProxyPool, ProxyEndpoint, build_mock_proxy_pool
 
 logger = logging.getLogger(__name__)
 
@@ -61,25 +70,92 @@ class PageFetcher(Protocol):
         ...
 
 
+RequestExecutor = Callable[[httpx.Client, str, str | None, ProxyEndpoint | None], httpx.Response | None]
+
+
+class RouteFailure(RuntimeError):
+    """供测试注入的明确路由失败信号。"""
+
+    def __init__(self, message: str, *, definitive: bool = False) -> None:
+        super().__init__(message)
+        self.definitive = definitive
+
+
 class HttpPageFetcher:
     """沿用原有 HTTP 抓取逻辑，作为回退方案。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        proxy_pool: MockProxyPool | None = None,
+        request_executor: RequestExecutor | None = None,
+    ) -> None:
         self._client = create_client()
+        self._proxy_pool = proxy_pool
+        self._request_executor = request_executor or self._execute_request
 
     def fetch(self, url: str, referer: str | None = None) -> str | None:
-        if referer:
-            self._client.headers["Referer"] = referer
+        if not self._proxy_pool:
+            response = self._request_executor(self._client, url, referer, None)
+            if response and response.status_code == 200:
+                return response.text
+            return None
 
-        response = self._do_request(url)
-        if response and response.status_code == 200:
-            return response.text
-        return None
+        attempted: set[str] = set()
+        last_reason = "未开始请求"
+        while True:
+            endpoint = self._proxy_pool.acquire(exclude=attempted)
+            if endpoint is None:
+                logger.error("mock 代理池没有可用节点，放弃抓取: %s | 最后失败: %s", url, last_reason)
+                return None
+
+            attempted.add(endpoint.name)
+            logger.debug("使用 mock 代理节点 %s 抓取: %s", endpoint.name, url)
+            try:
+                response = self._request_executor(self._client, url, referer, endpoint)
+            except Exception as exc:
+                last_reason = str(exc) or exc.__class__.__name__
+                disabled = self._proxy_pool.report_failure(
+                    endpoint,
+                    last_reason,
+                    definitive=_is_definitive_route_error(exc),
+                )
+                suffix = "，已标记失效" if disabled else ""
+                logger.warning("mock 代理节点 %s 请求异常: %s%s", endpoint.name, last_reason, suffix)
+                continue
+
+            if response and response.status_code == 200:
+                self._proxy_pool.report_success(endpoint)
+                return response.text
+
+            if response is not None and not _should_failover_status(response.status_code):
+                logger.error("HTTP %s，当前请求不触发 failover", response.status_code)
+                return None
+
+            last_reason = f"HTTP {response.status_code}" if response is not None else "空响应"
+            disabled = self._proxy_pool.report_failure(
+                endpoint,
+                last_reason,
+                definitive=response is not None and response.status_code == 407,
+            )
+            suffix = "，已标记失效" if disabled else ""
+            logger.warning("mock 代理节点 %s 失败: %s%s", endpoint.name, last_reason, suffix)
 
     @retry_on_failure()
-    def _do_request(self, url: str) -> httpx.Response:
+    def _do_request(self, client: httpx.Client, url: str, referer: str | None = None) -> httpx.Response:
         logger.debug("HTTP GET %s", url)
-        return self._client.get(url)
+        headers = {"Referer": referer} if referer else None
+        return client.get(url, headers=headers)
+
+    def _execute_request(
+        self,
+        client: httpx.Client,
+        url: str,
+        referer: str | None,
+        endpoint: ProxyEndpoint | None,
+    ) -> httpx.Response | None:
+        if endpoint:
+            logger.debug("mock 代理节点 %s 当前仅用于 failover 测试，不修改真实网络出口", endpoint.name)
+        return self._do_request(client, url, referer=referer)
 
     def rotate_identity(self) -> None:
         self._client.headers["User-Agent"] = random_user_agent()
@@ -159,6 +235,8 @@ class ChromeMcpPageFetcher:
     def _ensure_started(self) -> None:
         if self._started:
             return
+        if ClientSession is None or StdioServerParameters is None or stdio_client is None:
+            raise RuntimeError("mcp 后端需要先安装依赖：pip install -e . 或 pip install mcp")
 
         self._thread = threading.Thread(target=self._run_loop, name="chrome-mcp-fetcher", daemon=True)
         self._thread.start()
@@ -391,5 +469,30 @@ def create_page_fetcher(backend: str) -> PageFetcher:
     if backend == "mcp":
         return ChromeMcpPageFetcher()
     if backend == "http":
-        return HttpPageFetcher()
+        return HttpPageFetcher(proxy_pool=_load_mock_proxy_pool())
     raise ValueError(f"不支持的抓取后端: {backend}")
+
+
+def _should_failover_status(status_code: int) -> bool:
+    return status_code in {407, 502, 503, 504}
+
+
+def _is_definitive_route_error(exc: Exception) -> bool:
+    if isinstance(exc, RouteFailure):
+        return exc.definitive
+    return isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout))
+
+
+def _load_mock_proxy_pool() -> MockProxyPool | None:
+    if PROXY_POOL_MODE != "mock":
+        return None
+    try:
+        pool = build_mock_proxy_pool(PROXY_POOL_CONFIG, max_failures=PROXY_MAX_FAILURES)
+    except ValueError as exc:
+        logger.error("mock 代理池配置无效: %s", exc)
+        return None
+    if pool:
+        logger.info("已启用 mock 代理池，共 %s 个节点", len(pool.snapshot()))
+    else:
+        logger.warning("DOUBAN_PROXY_POOL_MODE=mock 但未提供可用节点，已忽略")
+    return pool

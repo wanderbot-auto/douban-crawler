@@ -36,6 +36,25 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+
+def _load_proxy_pool_config() -> str:
+    raw = os.environ.get("DOUBAN_PROXY_POOL", "")
+    if raw.strip():
+        return raw
+
+    configured_path = os.environ.get("DOUBAN_PROXY_POOL_FILE", "").strip()
+    proxy_pool_path = Path(configured_path) if configured_path else DATA_DIR / "mock_proxy_pool.json"
+    if not proxy_pool_path.is_absolute():
+        proxy_pool_path = PROJECT_ROOT / proxy_pool_path
+
+    try:
+        if proxy_pool_path.exists():
+            return proxy_pool_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return ""
+
+
 # 数据库路径
 DB_PATH = DATA_DIR / "douban_group.db"
 
@@ -62,6 +81,11 @@ LONG_PAUSE_MAX = float(os.environ.get("DOUBAN_LONG_PAUSE_MAX", "30.0"))
 
 # 页面访问后端：mcp / http
 FETCH_BACKEND = os.environ.get("DOUBAN_FETCH_BACKEND", "mcp").strip().lower() or "mcp"
+
+# mock 代理池配置（仅用于测试 failover 机制）
+PROXY_POOL_MODE = os.environ.get("DOUBAN_PROXY_POOL_MODE", "off").strip().lower() or "off"
+PROXY_POOL_CONFIG = _load_proxy_pool_config()
+PROXY_MAX_FAILURES = int(os.environ.get("DOUBAN_PROXY_MAX_FAILURES", "2"))
 
 # Cookie 配置 —— 仅 http 后端使用
 DOUBAN_COOKIE = os.environ.get("DOUBAN_COOKIE", "")

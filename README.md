@@ -32,6 +32,7 @@ douban-crawler crawl --pages 3
 - **断点续爬** — 支持跳过前 N 页，从指定页继续补历史数据
 - **数据导出** — 支持 CSV / JSON 格式导出
 - **双后端访问** — 默认 `mcp`，必要时可切回 `http`
+- **可测试 failover** — 提供 mock 代理池状态机，便于验证节点切换逻辑
 
 ## 页面访问方式
 
@@ -115,9 +116,51 @@ export DOUBAN_MCP_ARGS="-y chrome-devtools-mcp@latest --slim --viewport 1440x180
 - `DOUBAN_MCP_READY_TIMEOUT` — 页面就绪等待超时，默认 `20`
 - `DOUBAN_MCP_STABILIZE_DELAY` — DOM 稳定额外等待秒数，默认 `1.0`
 - `DOUBAN_COOKIE` — 豆瓣 Cookie；`http` 直接使用，`mcp` 会尝试同步浏览器可写 Cookie
+- `DOUBAN_PROXY_POOL_MODE` — `off` / `mock`，默认 `off`
+- `DOUBAN_PROXY_POOL` — mock 代理池配置；支持 JSON 数组或逗号/换行分隔的节点名
+- `DOUBAN_PROXY_MAX_FAILURES` — mock 节点连续失败多少次后标记失效，默认 `2`
 - `DOUBAN_MIN_REQUEST_INTERVAL` / `DOUBAN_MAX_REQUEST_INTERVAL` — 常规请求间隔秒数
 - `DOUBAN_LONG_PAUSE_EVERY` / `DOUBAN_LONG_PAUSE_MIN` / `DOUBAN_LONG_PAUSE_MAX` — 长暂停策略
 - `LOG_LEVEL` — 日志级别，默认 `INFO`
+
+## Mock Proxy Pool
+
+`douban_crawler/transport/proxy_pool.py` 提供了一个纯内存的 mock 代理池，不建立真实代理连接，只负责：
+
+- 轮询选择节点
+- 记录成功 / 失败
+- 在明确失败或连续失败达到阈值后切换节点
+- 输出可断言的 `acquire_history` / `failure_history`
+
+启用方式：
+
+```bash
+export DOUBAN_FETCH_BACKEND="http"
+export DOUBAN_PROXY_POOL_MODE="mock"
+export DOUBAN_PROXY_POOL='["proxy-a", "proxy-b", "proxy-c"]'
+```
+
+也可以用对象数组保留额外元数据：
+
+```bash
+export DOUBAN_PROXY_POOL='[
+  {"name":"proxy-a","region":"test-a"},
+  {"name":"proxy-b","region":"test-b"}
+]'
+```
+
+当前默认 HTTP 请求仍然直连；mock 节点只用于测试 failover 机制本身。要做单元测试时，可以给 `HttpPageFetcher` 或 `DoubanGroupCrawler` 注入自定义 executor / fetcher factory，按节点名模拟成功和失败。 
+
+也支持直接放 `vmess://...` 字符串做本地解码展示：
+
+```bash
+export DOUBAN_PROXY_POOL='[
+  "vmess://<base64-json>",
+  {"vmess":"vmess://<base64-json>","tag":"candidate-b"}
+]'
+```
+
+这类输入只会被解析为 mock 元数据并保存在 `ProxyEndpoint.metadata` 中，例如 `server_host`、`server_port`、`network`、`host_header`、`path`、`tls`、`ps` 对应的展示名等；不会生成真实可连接代理，也不会改变实际网络出口。
 
 建议的抗封配置：
 
@@ -157,5 +200,8 @@ douban-group-crawler/
     ├── fetcher.py
     ├── models.py
     ├── parser.py
+    ├── transport/
+    │   ├── __init__.py
+    │   └── proxy_pool.py
     └── storage.py
 ```
