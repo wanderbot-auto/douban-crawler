@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import threading
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from mcp.client.stdio import stdio_client
 
 from douban_crawler.anti_crawl import create_client, generate_bid, random_user_agent, retry_on_failure
 from douban_crawler.config import (
+    DOUBAN_BASE_URL,
+    DOUBAN_COOKIE,
     DOUBAN_MCP_ARGS,
     DOUBAN_MCP_COMMAND,
     DOUBAN_MCP_NAV_TIMEOUT,
@@ -29,6 +32,15 @@ from douban_crawler.config import (
 logger = logging.getLogger(__name__)
 
 _HTML_SNAPSHOT_SCRIPT = """({
+  readyState: document.readyState,
+  title: document.title,
+  url: location.href,
+  html: document.documentElement ? document.documentElement.outerHTML : '',
+  htmlLength: document.documentElement ? document.documentElement.outerHTML.length : 0,
+  bodyText: document.body ? document.body.innerText.slice(0, 400) : ''
+})"""
+
+_EVALUATE_SCRIPT_FUNCTION = """() => ({
   readyState: document.readyState,
   title: document.title,
   url: location.href,
@@ -102,6 +114,10 @@ class ChromeMcpPageFetcher:
         self._started = False
         self._last_url: str | None = None
         self._referer_warmed: set[str] = set()
+        self._tool_mode = "slim"
+        self._page_ready = False
+        self._douban_cookies_synced = False
+        self._douban_cookie_items = _parse_cookie_string(DOUBAN_COOKIE)
         self._errlog = open(os.devnull, "w", encoding="utf-8")
 
     def fetch(self, url: str, referer: str | None = None) -> str | None:
@@ -178,16 +194,23 @@ class ChromeMcpPageFetcher:
                 await session.initialize()
                 tools = await session.list_tools()
                 tool_names = {tool.name for tool in tools.tools}
-                required = {"navigate", "evaluate"}
-                missing = required - tool_names
-                if missing:
-                    raise RuntimeError(f"Chrome MCP 缺少工具: {', '.join(sorted(missing))}")
+                if {"navigate", "evaluate"} <= tool_names:
+                    self._tool_mode = "slim"
+                elif {"new_page", "navigate_page", "evaluate_script"} <= tool_names:
+                    self._tool_mode = "full"
+                else:
+                    raise RuntimeError(
+                        "Chrome MCP 缺少可用工具组合，需要 slim(navigate/evaluate) "
+                        "或完整模式(new_page/navigate_page/evaluate_script)"
+                    )
 
                 self._session = session
                 self._ready.set()
                 await self._shutdown_event.wait()
 
     async def _fetch_html(self, url: str, referer: str | None = None) -> str | None:
+        await self._sync_douban_cookies_if_needed(url)
+
         if referer and referer != url and referer not in self._referer_warmed and not self._last_url:
             logger.debug("MCP 预热 referer: %s", referer)
             await self._navigate(referer)
@@ -199,12 +222,52 @@ class ChromeMcpPageFetcher:
         self._last_url = snapshot.get("url") or url
         return snapshot.get("html") or None
 
-    async def _navigate(self, url: str) -> None:
-        result = await self._call_tool(
-            "navigate",
-            {"url": url},
-            timeout=self._settings.navigate_timeout,
+    async def _sync_douban_cookies_if_needed(self, url: str) -> None:
+        if self._douban_cookies_synced or not self._douban_cookie_items or "douban.com" not in url:
+            return
+
+        logger.info("向 MCP 浏览器同步 %s 个 Douban Cookie（仅浏览器可写项）", len(self._douban_cookie_items))
+        await self._navigate(DOUBAN_BASE_URL)
+        await self._set_browser_cookies(self._douban_cookie_items)
+        await asyncio.sleep(0.5)
+        self._douban_cookies_synced = True
+
+    async def _set_browser_cookies(self, cookies: dict[str, str]) -> None:
+        if self._tool_mode == "slim":
+            await self._call_tool(
+                "evaluate",
+                {"script": _build_cookie_injection_script(cookies)},
+                timeout=self._settings.ready_timeout,
+            )
+            return
+
+        payload = await self._call_tool(
+            "evaluate_script",
+            {"function": _build_set_cookies_function(cookies)},
+            timeout=self._settings.ready_timeout,
         )
+        logger.debug("MCP Cookie 同步结果: %s", payload[:120])
+
+    async def _navigate(self, url: str) -> None:
+        if self._tool_mode == "slim":
+            result = await self._call_tool(
+                "navigate",
+                {"url": url},
+                timeout=self._settings.navigate_timeout,
+            )
+        elif not self._page_ready:
+            result = await self._call_tool(
+                "new_page",
+                {"url": url, "timeout": int(self._settings.navigate_timeout * 1000)},
+                timeout=self._settings.navigate_timeout,
+            )
+            self._page_ready = True
+        else:
+            result = await self._call_tool(
+                "navigate_page",
+                {"type": "url", "url": url, "timeout": int(self._settings.navigate_timeout * 1000)},
+                timeout=self._settings.navigate_timeout,
+            )
         logger.debug("MCP 导航成功: %s | %s", url, result[:120])
 
     async def _wait_until_ready(self) -> dict[str, object]:
@@ -229,13 +292,20 @@ class ChromeMcpPageFetcher:
         return snapshot
 
     async def _evaluate_snapshot(self) -> dict[str, object]:
-        payload = await self._call_tool(
-            "evaluate",
-            {"script": _HTML_SNAPSHOT_SCRIPT},
-            timeout=self._settings.ready_timeout,
-        )
+        if self._tool_mode == "slim":
+            payload = await self._call_tool(
+                "evaluate",
+                {"script": _HTML_SNAPSHOT_SCRIPT},
+                timeout=self._settings.ready_timeout,
+            )
+        else:
+            payload = await self._call_tool(
+                "evaluate_script",
+                {"function": _EVALUATE_SCRIPT_FUNCTION},
+                timeout=self._settings.ready_timeout,
+            )
         try:
-            return json.loads(payload)
+            return json.loads(_extract_json_payload(payload))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"MCP evaluate 返回了不可解析的数据: {payload[:200]}") from exc
 
@@ -266,6 +336,55 @@ def _result_to_text(result: object) -> str:
     items = getattr(result, "content", []) or []
     texts = [item.text for item in items if getattr(item, "type", None) == "text"]
     return "\n".join(texts).strip()
+
+
+def _extract_json_payload(text: str) -> str:
+    fenced = re.search(r"```json\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _parse_cookie_string(raw: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def _build_cookie_injection_script(cookies: dict[str, str]) -> str:
+    payload = json.dumps(cookies, ensure_ascii=False)
+    return f"""(() => {{
+  const cookies = {payload};
+  const applied = [];
+  for (const [key, value] of Object.entries(cookies)) {{
+    document.cookie = `${{key}}=${{value}}; path=/; domain=.douban.com; SameSite=Lax`;
+    applied.push(key);
+  }}
+  return JSON.stringify({{ applied, cookie: document.cookie }});
+}})()"""
+
+
+def _build_set_cookies_function(cookies: dict[str, str]) -> str:
+    payload = json.dumps(cookies, ensure_ascii=False)
+    return f"""() => {{
+  const cookies = {payload};
+  const applied = [];
+  for (const [key, value] of Object.entries(cookies)) {{
+    document.cookie = `${{key}}=${{value}}; path=/; domain=.douban.com; SameSite=Lax`;
+    applied.push(key);
+  }}
+  return {{ applied, cookie: document.cookie }};
+}}"""
 
 
 def create_page_fetcher(backend: str) -> PageFetcher:

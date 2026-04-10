@@ -75,11 +75,11 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 3
 
-MIN_INTERVAL = 3.0
-MAX_INTERVAL = 8.0
-LONG_PAUSE_EVERY = 15
-LONG_PAUSE_MIN = 15.0
-LONG_PAUSE_MAX = 30.0
+MIN_INTERVAL = float(os.environ.get("DOUBAN_MIN_REQUEST_INTERVAL", "3.0"))
+MAX_INTERVAL = float(os.environ.get("DOUBAN_MAX_REQUEST_INTERVAL", "8.0"))
+LONG_PAUSE_EVERY = int(os.environ.get("DOUBAN_LONG_PAUSE_EVERY", "15"))
+LONG_PAUSE_MIN = float(os.environ.get("DOUBAN_LONG_PAUSE_MIN", "15.0"))
+LONG_PAUSE_MAX = float(os.environ.get("DOUBAN_LONG_PAUSE_MAX", "30.0"))
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -93,7 +93,7 @@ def _build_default_mcp_args() -> str:
     auto_connect = _env_flag("DOUBAN_MCP_AUTO_CONNECT", False)
     channel = os.environ.get("DOUBAN_MCP_CHANNEL", "").strip()
 
-    parts = ["-y", "chrome-devtools-mcp@latest", "--slim"]
+    parts = ["-y", "chrome-devtools-mcp@latest"]
     if browser_url:
         parts.append(f"--browserUrl={browser_url}")
     elif auto_connect:
@@ -101,12 +101,13 @@ def _build_default_mcp_args() -> str:
         if channel:
             parts.append(f"--channel={channel}")
     else:
-        parts.extend(["--headless", "--isolated", "--viewport", "1440x1800"])
+        parts.extend(["--slim", "--headless", "--isolated", "--viewport", "1440x1800"])
     return " ".join(parts)
 
 
 FETCH_BACKEND = os.environ.get("DOUBAN_FETCH_BACKEND", "mcp").strip().lower() or "mcp"
-DOUBAN_COOKIE_ENV = os.environ.get("DOUBAN_COOKIE", "") or (
+DOUBAN_COOKIE_RAW = os.environ.get("DOUBAN_COOKIE", "")
+DOUBAN_COOKIE_ENV = DOUBAN_COOKIE_RAW or (
     'bid=qExCrbdUTM8; ll="108288"; _pk_id.100001.8cb4=3ea132d009284f2a.1775486888.;'
     " __utmc=30149280;"
     " __utmz=30149280.1775486888.1.1.utmcsr=rebang.today|utmccn=(referral)|utmcmd=referral|utmcct=/;"
@@ -253,6 +254,15 @@ _MCP_SNAPSHOT_SCRIPT = """({
   bodyText: document.body ? document.body.innerText.slice(0, 400) : ""
 })"""
 
+_MCP_EVALUATE_FUNCTION = """() => ({
+  readyState: document.readyState,
+  title: document.title,
+  url: location.href,
+  html: document.documentElement ? document.documentElement.outerHTML : "",
+  htmlLength: document.documentElement ? document.documentElement.outerHTML.length : 0,
+  bodyText: document.body ? document.body.innerText.slice(0, 400) : ""
+})"""
+
 
 class HttpClient:
     """基于 urllib 的 HTTP 客户端，内置反爬 headers"""
@@ -363,9 +373,14 @@ class ChromeMcpPageFetcher:
         self._startup_error: Exception | None = None
         self._last_url = ""
         self._warmed_referers: set[str] = set()
+        self._tool_mode = "slim"
+        self._page_ready = False
+        self._douban_cookies_synced = False
+        self._douban_cookie_items = _parse_cookie_str(DOUBAN_COOKIE_RAW)
 
     def fetch(self, url: str, referer: str | None = None) -> str | None:
         self._ensure_started()
+        self._sync_douban_cookies_if_needed(url)
         if referer and referer != url and referer not in self._warmed_referers and not self._last_url:
             logger.debug(f"MCP 预热 referer: {referer}")
             self._navigate(referer)
@@ -379,6 +394,31 @@ class ChromeMcpPageFetcher:
 
     def rotate(self) -> None:
         logger.debug("MCP Chrome 模式跳过 UA/Cookie 轮换")
+
+    def _sync_douban_cookies_if_needed(self, url: str) -> None:
+        if self._douban_cookies_synced or not self._douban_cookie_items or "douban.com" not in url:
+            return
+
+        logger.info(f"向 MCP 浏览器同步 {len(self._douban_cookie_items)} 个 Douban Cookie（仅浏览器可写项）")
+        self._navigate(DOUBAN_BASE)
+        self._set_browser_cookies(self._douban_cookie_items)
+        time.sleep(0.5)
+        self._douban_cookies_synced = True
+
+    def _set_browser_cookies(self, cookies: dict[str, str]) -> None:
+        if self._tool_mode == "slim":
+            self._call_tool(
+                "evaluate",
+                {"script": _build_cookie_injection_script(cookies)},
+                timeout=DOUBAN_MCP_READY_TIMEOUT,
+            )
+            return
+
+        self._call_tool(
+            "evaluate_script",
+            {"function": _build_set_cookies_function(cookies)},
+            timeout=DOUBAN_MCP_READY_TIMEOUT,
+        )
 
     def close(self) -> None:
         if not self._started:
@@ -430,15 +470,35 @@ class ChromeMcpPageFetcher:
                 await session.initialize()
                 tools = await session.list_tools()
                 tool_names = {tool.name for tool in tools.tools}
-                missing = {"navigate", "evaluate"} - tool_names
-                if missing:
-                    raise RuntimeError(f"MCP 缺少必要工具: {', '.join(sorted(missing))}")
+                if {"navigate", "evaluate"} <= tool_names:
+                    self._tool_mode = "slim"
+                elif {"new_page", "navigate_page", "evaluate_script"} <= tool_names:
+                    self._tool_mode = "full"
+                else:
+                    raise RuntimeError(
+                        "MCP 缺少可用工具组合，需要 slim(navigate/evaluate) "
+                        "或完整模式(new_page/navigate_page/evaluate_script)"
+                    )
                 self._session = session
                 self._ready.set()
                 await self._shutdown_event.wait()
 
     def _navigate(self, url: str) -> None:
-        text = self._call_tool("navigate", {"url": url}, timeout=DOUBAN_MCP_NAV_TIMEOUT)
+        if self._tool_mode == "slim":
+            text = self._call_tool("navigate", {"url": url}, timeout=DOUBAN_MCP_NAV_TIMEOUT)
+        elif not self._page_ready:
+            text = self._call_tool(
+                "new_page",
+                {"url": url, "timeout": int(DOUBAN_MCP_NAV_TIMEOUT * 1000)},
+                timeout=DOUBAN_MCP_NAV_TIMEOUT,
+            )
+            self._page_ready = True
+        else:
+            text = self._call_tool(
+                "navigate_page",
+                {"type": "url", "url": url, "timeout": int(DOUBAN_MCP_NAV_TIMEOUT * 1000)},
+                timeout=DOUBAN_MCP_NAV_TIMEOUT,
+            )
         logger.debug(f"MCP 导航成功: {url} | {text[:120]}")
 
     def _wait_until_ready(self) -> dict[str, Any]:
@@ -463,13 +523,20 @@ class ChromeMcpPageFetcher:
         return snapshot
 
     def _snapshot(self) -> dict[str, Any]:
-        payload = self._call_tool(
-            "evaluate",
-            {"script": _MCP_SNAPSHOT_SCRIPT},
-            timeout=DOUBAN_MCP_READY_TIMEOUT,
-        )
+        if self._tool_mode == "slim":
+            payload = self._call_tool(
+                "evaluate",
+                {"script": _MCP_SNAPSHOT_SCRIPT},
+                timeout=DOUBAN_MCP_READY_TIMEOUT,
+            )
+        else:
+            payload = self._call_tool(
+                "evaluate_script",
+                {"function": _MCP_EVALUATE_FUNCTION},
+                timeout=DOUBAN_MCP_READY_TIMEOUT,
+            )
         try:
-            return json.loads(payload)
+            return json.loads(_extract_json_payload(payload))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"MCP evaluate 返回不可解析数据: {payload[:200]}") from exc
 
@@ -508,6 +575,55 @@ class ChromeMcpPageFetcher:
         if not self._loop:
             raise RuntimeError("Chrome MCP 事件循环未就绪")
         return self._loop
+
+
+def _extract_json_payload(text: str) -> str:
+    fenced = re.search(r"```json\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _parse_cookie_str(raw: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        cookies[k.strip()] = v.strip()
+    return cookies
+
+
+def _build_cookie_injection_script(cookies: dict[str, str]) -> str:
+    payload = json.dumps(cookies, ensure_ascii=False)
+    return f"""(() => {{
+  const cookies = {payload};
+  const applied = [];
+  for (const [key, value] of Object.entries(cookies)) {{
+    document.cookie = `${{key}}=${{value}}; path=/; domain=.douban.com; SameSite=Lax`;
+    applied.push(key);
+  }}
+  return JSON.stringify({{ applied, cookie: document.cookie }});
+}})()"""
+
+
+def _build_set_cookies_function(cookies: dict[str, str]) -> str:
+    payload = json.dumps(cookies, ensure_ascii=False)
+    return f"""() => {{
+  const cookies = {payload};
+  const applied = [];
+  for (const [key, value] of Object.entries(cookies)) {{
+    document.cookie = `${{key}}=${{value}}; path=/; domain=.douban.com; SameSite=Lax`;
+    applied.push(key);
+  }}
+  return {{ applied, cookie: document.cookie }};
+}}"""
 
 
 def create_page_fetcher(
@@ -556,8 +672,8 @@ def _strip_tags(html_str: str) -> str:
 def _check_blocked(body: str) -> None:
     if "检测到有异常请求" in body or "异常请求" in body:
         logger.error("被豆瓣反爬机制拦截！建议：增大请求间隔 / 更换 IP / 设置 DOUBAN_COOKIE")
-    elif re.search(r"<title>[^<]*登录[^<]*豆瓣", body):
-        logger.warning("可能需要登录才能访问，请设置 DOUBAN_COOKIE 环境变量")
+    elif re.search(r"<title>[^<]*(登录|登录跳转)[^<]*</title>", body) and "豆瓣" in body:
+        logger.warning("当前命中登录跳转页；优先连接已登录的 Chrome，必要时再补 DOUBAN_COOKIE")
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +1050,8 @@ class DoubanGroupCrawler:
     def __init__(
         self, group_id: str = DEFAULT_GROUP, tab_id: str = "",
         storage: Storage | None = None,
-        max_pages: int = 0, fetch_details: bool = False, fetch_comments: bool = False,
+        max_pages: int = 0, skip_pages: int = 0,
+        fetch_details: bool = False, fetch_comments: bool = False,
         fetch_backend: str = FETCH_BACKEND,
         mcp_args: str | None = None,
     ) -> None:
@@ -942,6 +1059,7 @@ class DoubanGroupCrawler:
         self.tab_id = tab_id
         self.storage = storage or Storage()
         self.max_pages = max_pages
+        self.skip_pages = skip_pages
         self.fetch_details = fetch_details
         self.fetch_comments = fetch_comments
         self.fetch_backend = fetch_backend
@@ -949,7 +1067,7 @@ class DoubanGroupCrawler:
         self._fetcher = create_page_fetcher(fetch_backend, mcp_args=mcp_args)
         self._limiter = RateLimiter()
         self.stats: dict[str, int] = {
-            "pages_fetched": 0, "topics_found": 0, "topics_new": 0,
+            "pages_fetched": 0, "pages_skipped": 0, "topics_found": 0, "topics_new": 0,
             "topics_updated": 0, "details_fetched": 0,
             "comments_fetched": 0, "comments_updated": 0, "errors": 0,
         }
@@ -960,6 +1078,7 @@ class DoubanGroupCrawler:
         tab_info = f" tab={self.tab_id}" if self.tab_id else ""
         logger.info(f"开始爬取小组 {self.group_id}{tab_info}")
         logger.info(f"页面访问后端: {self.fetch_backend}")
+        logger.info(f"页数配置: max_pages={self.max_pages or '全部'}, skip_pages={self.skip_pages}")
         try:
             topics = self._crawl_list()
             if self.fetch_details and topics:
@@ -986,18 +1105,37 @@ class DoubanGroupCrawler:
             return all_topics
 
         total = parse_total_pages(first_html)
-        if self.max_pages > 0:
-            total = min(total, self.max_pages)
-        logger.info(f"共 {total} 页待爬取")
+        start_page = self.skip_pages + 1
+        if start_page > total:
+            self.stats["pages_skipped"] = total
+            logger.warning(f"跳过页数 {self.skip_pages} 已覆盖全部 {total} 页，本次无需爬取列表")
+            return all_topics
 
-        topics = parse_topic_list(first_html, self.group_id, self.tab_id)
+        end_page = total
+        if self.max_pages > 0:
+            end_page = min(total, self.skip_pages + self.max_pages)
+
+        self.stats["pages_skipped"] = start_page - 1
+        logger.info(f"共 {total} 页，跳过 {self.stats['pages_skipped']} 页，实际爬取第 {start_page} 到第 {end_page} 页")
+
+        if start_page == 1:
+            topics = parse_topic_list(first_html, self.group_id, self.tab_id)
+        else:
+            start = (start_page - 1) * TOPICS_PER_PAGE
+            logger.info(f"爬取第 {start_page}/{total} 页 (start={start})")
+            topics = self._fetch_and_parse_list(start, start_page)
+
+        if not topics:
+            logger.warning(f"第 {start_page} 页未解析到帖子")
+            return all_topics
+
         all_topics.extend(self._save(topics, existing))
         self.stats["pages_fetched"] += 1
 
         consecutive_empty = 0
         max_empty_retries = 3  # 连续空页重试次数
 
-        for page in range(2, total + 1):
+        for page in range(start_page + 1, end_page + 1):
             start = (page - 1) * TOPICS_PER_PAGE
             logger.info(f"爬取第 {page}/{total} 页 (start={start})")
 
@@ -1170,7 +1308,7 @@ def build_mcp_args_override(
     if not browser_url and not auto_connect and not channel:
         return None
 
-    parts = ["-y", "chrome-devtools-mcp@latest", "--slim"]
+    parts = ["-y", "chrome-devtools-mcp@latest"]
     if browser_url:
         parts.append(f"--browserUrl={browser_url}")
     else:
@@ -1188,6 +1326,7 @@ def main() -> None:
 示例:
   python3 run.py                            通过 Chrome MCP 爬取默认小组默认 tab 前 3 页
   python3 run.py -p 10                      爬取前 10 页
+  python3 run.py --skip-pages 100 -p 20     跳过前 100 页，再爬 20 页
   python3 run.py -t 36280 -p 5 --details    指定 tab + 详情 + 评论
   python3 run.py -t "" -p 5                 不指定 tab（爬 /discussion）
   python3 run.py -p 5 --details --no-comments  详情但不爬评论
@@ -1214,6 +1353,7 @@ def main() -> None:
     ap.add_argument("-g", "--group", default=DEFAULT_GROUP, help=f"小组 ID（默认 {DEFAULT_GROUP}）")
     ap.add_argument("-t", "--tab", default=DEFAULT_TAB, help=f"Tab ID（默认 {DEFAULT_TAB}，留空则爬 /discussion）")
     ap.add_argument("-p", "--pages", type=int, default=3, help="最大页数，0=全部（默认 3）")
+    ap.add_argument("--skip-pages", type=int, default=0, help="跳过前 N 页后再开始爬取（默认 0）")
     ap.add_argument("--backend", choices=["mcp", "http"], default=FETCH_BACKEND, help=f"页面访问后端（默认 {FETCH_BACKEND}）")
     ap.add_argument("--mcp-browser-url", help="连接现有浏览器，例如 http://127.0.0.1:9222")
     ap.add_argument("--mcp-auto-connect", action="store_true", help="自动连接已开启 remote debugging 的现有 Chrome")
@@ -1225,6 +1365,8 @@ def main() -> None:
     ap.add_argument("-o", "--output", help="导出文件路径")
     ap.add_argument("--debug", action="store_true", help="调试日志")
     args = ap.parse_args()
+    if args.skip_pages < 0:
+        ap.error("--skip-pages 不能小于 0")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else getattr(logging, LOG_LEVEL, logging.INFO),
@@ -1269,6 +1411,7 @@ def main() -> None:
         else:
             print(f"  MCP连接: 启动独立 Chrome")
     print(f"  页数: {'不限' if args.pages == 0 else args.pages}")
+    print(f"  跳过页数: {args.skip_pages}")
     print(f"  详情: {'是' if wants_details else '否'}")
     print(f"  评论: {'是' if wants_comments else '否'}")
     print(f"  图片: 仅保存链接")
@@ -1279,6 +1422,7 @@ def main() -> None:
         group_id=args.group,
         tab_id=tab_id,
         max_pages=args.pages,
+        skip_pages=args.skip_pages,
         fetch_details=wants_details,
         fetch_comments=wants_comments,
         fetch_backend=args.backend,
@@ -1290,7 +1434,8 @@ def main() -> None:
     print(f"  爬取完成")
     print(f"{'=' * 42}")
     for k, label in [
-        ("pages_fetched", "页面"), ("topics_found", "发现帖子"),
+        ("pages_fetched", "页面"), ("pages_skipped", "跳过页面"),
+        ("topics_found", "发现帖子"),
         ("topics_new", "新增帖子"), ("topics_updated", "更新帖子"),
         ("details_fetched", "详情"), ("comments_fetched", "新增评论"),
         ("comments_updated", "更新评论"), ("errors", "错误"),

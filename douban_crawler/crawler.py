@@ -35,6 +35,7 @@ class DoubanGroupCrawler:
         group_id: str = DEFAULT_GROUP_ID,
         storage: Storage | None = None,
         max_pages: int = 0,
+        skip_pages: int = 0,
         fetch_details: bool = True,
         fetch_comments: bool = True,
         fetch_backend: str = FETCH_BACKEND,
@@ -42,6 +43,7 @@ class DoubanGroupCrawler:
         self.group_id = group_id
         self.storage = storage or Storage()
         self.max_pages = max_pages  # 0 = 全部
+        self.skip_pages = skip_pages
         self.fetch_details = fetch_details
         self.fetch_comments = fetch_comments
         self.fetch_backend = fetch_backend
@@ -51,6 +53,7 @@ class DoubanGroupCrawler:
 
         self.stats = {
             "pages_fetched": 0,
+            "pages_skipped": 0,
             "topics_found": 0,
             "topics_new": 0,
             "details_fetched": 0,
@@ -62,9 +65,10 @@ class DoubanGroupCrawler:
         """执行爬取任务，返回统计信息"""
         logger.info("开始爬取小组 %s 的讨论帖子", self.group_id)
         logger.info(
-            "配置: backend=%s, max_pages=%s, fetch_details=%s, fetch_comments=%s",
+            "配置: backend=%s, max_pages=%s, skip_pages=%s, fetch_details=%s, fetch_comments=%s",
             self.fetch_backend,
             self.max_pages or "全部",
+            self.skip_pages,
             self.fetch_details,
             self.fetch_comments,
         )
@@ -100,16 +104,50 @@ class DoubanGroupCrawler:
             return all_topics
 
         total_pages = parse_total_pages(first_page_html)
-        if self.max_pages > 0:
-            total_pages = min(total_pages, self.max_pages)
-        logger.info("共 %s 页待爬取", total_pages)
+        start_page = self.skip_pages + 1
+        if start_page > total_pages:
+            self.stats["pages_skipped"] = total_pages
+            logger.warning(
+                "跳过页数 %s 已覆盖全部 %s 页，本次无需爬取列表页",
+                self.skip_pages,
+                total_pages,
+            )
+            return all_topics
 
-        topics = parse_topic_list(first_page_html, self.group_id)
+        end_page = total_pages
+        if self.max_pages > 0:
+            end_page = min(total_pages, self.skip_pages + self.max_pages)
+
+        self.stats["pages_skipped"] = start_page - 1
+        logger.info(
+            "共 %s 页，跳过 %s 页，实际爬取第 %s 到第 %s 页",
+            total_pages,
+            self.stats["pages_skipped"],
+            start_page,
+            end_page,
+        )
+
+        if start_page == 1:
+            current_page_html = first_page_html
+        else:
+            start = (start_page - 1) * TOPICS_PER_PAGE
+            logger.info("正在爬取第 %s/%s 页 (start=%s)", start_page, total_pages, start)
+            current_page_html = self._fetch_discussion_page(start=start)
+            if not current_page_html:
+                logger.error("无法获取起始页 %s，终止列表爬取", start_page)
+                self.stats["errors"] += 1
+                return all_topics
+
+        topics = parse_topic_list(current_page_html, self.group_id)
+        if not topics:
+            logger.warning("第 %s 页未解析到帖子，可能已到末尾", start_page)
+            return all_topics
+
         new_topics = self._save_new_topics(topics, existing_ids)
         all_topics.extend(new_topics)
         self.stats["pages_fetched"] += 1
 
-        for page in range(2, total_pages + 1):
+        for page in range(start_page + 1, end_page + 1):
             start = (page - 1) * TOPICS_PER_PAGE
             logger.info("正在爬取第 %s/%s 页 (start=%s)", page, total_pages, start)
 
@@ -224,6 +262,7 @@ class DoubanGroupCrawler:
         logger.info("=" * 50)
         logger.info("爬取统计:")
         logger.info("  页面爬取: %s 页", self.stats["pages_fetched"])
+        logger.info("  页面跳过: %s 页", self.stats["pages_skipped"])
         logger.info("  帖子发现: %s 个", self.stats["topics_found"])
         logger.info("  新增帖子: %s 个", self.stats["topics_new"])
         logger.info("  详情爬取: %s 个", self.stats["details_fetched"])

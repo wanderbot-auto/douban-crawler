@@ -308,4 +308,4 @@ def _check_blocked(soup: BeautifulSoup) -> None:
     if "检测到有异常请求" in title or "异常请求" in str(soup):
         logger.error("🚫 被豆瓣反爬机制拦截！建议：增大请求间隔 / 更换 IP / 设置登录 Cookie")
     elif "登录" in title and "豆瓣" in title:
-        logger.warning("⚠️ 可能需要登录才能访问，请设置 DOUBAN_COOKIE 环境变量")
+        logger.warning("⚠️ 当前命中登录跳转页；优先连接已登录的 Chrome，必要时再补 DOUBAN_COOKIE")

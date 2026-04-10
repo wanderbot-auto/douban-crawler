@@ -35,16 +35,18 @@ def main(debug: bool) -> None:
 @main.command()
 @click.option("--group", "-g", default=DEFAULT_GROUP_ID, help="小组 ID")
 @click.option("--pages", "-p", default=0, type=int, help="最大爬取页数（0=全部）")
+@click.option("--skip-pages", default=0, type=click.IntRange(min=0), help="跳过前 N 页后再开始爬取")
 @click.option("--no-details", is_flag=True, help="不爬取帖子详情")
 @click.option("--no-comments", is_flag=True, help="不爬取评论")
 @click.option("--backend", type=click.Choice(["mcp", "http"]), default=FETCH_BACKEND, show_default=True, help="页面访问后端")
-def crawl(group: str, pages: int, no_details: bool, no_comments: bool, backend: str) -> None:
+def crawl(group: str, pages: int, skip_pages: int, no_details: bool, no_comments: bool, backend: str) -> None:
     """爬取小组讨论帖子"""
     comments_enabled = (not no_details) and (not no_comments)
 
     console.print(f"[bold green]🕷 开始爬取豆瓣小组[/bold green] [cyan]{group}[/cyan]")
     console.print(f"  目标: https://www.douban.com/group/{group}/")
     console.print(f"  页数限制: {'不限' if pages == 0 else pages}")
+    console.print(f"  跳过页数: {skip_pages}")
     console.print(f"  爬取详情: {'否' if no_details else '是'}")
     console.print(f"  爬取评论: {'是' if comments_enabled else '否'}")
     console.print(f"  访问后端: {backend}")
@@ -53,6 +55,7 @@ def crawl(group: str, pages: int, no_details: bool, no_comments: bool, backend: 
     crawler = DoubanGroupCrawler(
         group_id=group,
         max_pages=pages,
+        skip_pages=skip_pages,
         fetch_details=not no_details,
         fetch_comments=comments_enabled,
         fetch_backend=backend,
@@ -66,6 +69,7 @@ def crawl(group: str, pages: int, no_details: bool, no_comments: bool, backend: 
     table.add_column("指标", style="cyan")
     table.add_column("数值", justify="right", style="green")
     table.add_row("爬取页数", str(stats["pages_fetched"]))
+    table.add_row("跳过页数", str(stats["pages_skipped"]))
     table.add_row("发现帖子", str(stats["topics_found"]))
     table.add_row("新增帖子", str(stats["topics_new"]))
     table.add_row("详情爬取", str(stats["details_fetched"]))

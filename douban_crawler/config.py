@@ -5,6 +5,30 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_default_mcp_args() -> str:
+    browser_url = os.environ.get("DOUBAN_MCP_BROWSER_URL", "").strip()
+    auto_connect = _env_flag("DOUBAN_MCP_AUTO_CONNECT", False)
+    channel = os.environ.get("DOUBAN_MCP_CHANNEL", "").strip()
+
+    parts = ["-y", "chrome-devtools-mcp@latest"]
+    if browser_url:
+        parts.append(f"--browserUrl={browser_url}")
+    elif auto_connect:
+        parts.append("--autoConnect")
+        if channel:
+            parts.append(f"--channel={channel}")
+    else:
+        parts.extend(["--slim", "--headless", "--isolated", "--viewport", "1440x1800"])
+    return " ".join(parts)
+
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -30,11 +54,11 @@ MAX_RETRIES = 5
 RETRY_BASE_DELAY = 3  # 重试基础延迟（秒），指数退避
 
 # 反爬配置
-MIN_REQUEST_INTERVAL = 3.0   # 最小请求间隔（秒）
-MAX_REQUEST_INTERVAL = 8.0   # 最大请求间隔（秒）
-LONG_PAUSE_EVERY = 15        # 每隔 N 个请求执行一次长暂停
-LONG_PAUSE_MIN = 15.0        # 长暂停最小秒数
-LONG_PAUSE_MAX = 30.0        # 长暂停最大秒数
+MIN_REQUEST_INTERVAL = float(os.environ.get("DOUBAN_MIN_REQUEST_INTERVAL", "3.0"))
+MAX_REQUEST_INTERVAL = float(os.environ.get("DOUBAN_MAX_REQUEST_INTERVAL", "8.0"))
+LONG_PAUSE_EVERY = int(os.environ.get("DOUBAN_LONG_PAUSE_EVERY", "15"))
+LONG_PAUSE_MIN = float(os.environ.get("DOUBAN_LONG_PAUSE_MIN", "15.0"))
+LONG_PAUSE_MAX = float(os.environ.get("DOUBAN_LONG_PAUSE_MAX", "30.0"))
 
 # 页面访问后端：mcp / http
 FETCH_BACKEND = os.environ.get("DOUBAN_FETCH_BACKEND", "mcp").strip().lower() or "mcp"
@@ -46,7 +70,7 @@ DOUBAN_COOKIE = os.environ.get("DOUBAN_COOKIE", "")
 DOUBAN_MCP_COMMAND = os.environ.get("DOUBAN_MCP_COMMAND", "npx")
 DOUBAN_MCP_ARGS = os.environ.get(
     "DOUBAN_MCP_ARGS",
-    "-y chrome-devtools-mcp@latest --slim --headless --isolated --viewport 1440x1800",
+    _build_default_mcp_args(),
 )
 DOUBAN_MCP_STARTUP_TIMEOUT = float(os.environ.get("DOUBAN_MCP_STARTUP_TIMEOUT", "45"))
 DOUBAN_MCP_NAV_TIMEOUT = float(os.environ.get("DOUBAN_MCP_NAV_TIMEOUT", "45"))
