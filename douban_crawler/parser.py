@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
 
 from douban_crawler.config import DOUBAN_BASE_URL
-from douban_crawler.models import Topic, TopicDetail, Comment
+from douban_crawler.models import Topic, TopicDetail
 
 logger = logging.getLogger(__name__)
 
@@ -169,81 +169,6 @@ def parse_topic_detail(html: str, topic_id: str) -> TopicDetail | None:
     return detail
 
 
-def parse_comments(html: str, topic_id: str) -> list[Comment]:
-    """解析帖子页面中的评论
-
-    评论结构:
-    <ul id="comments">
-      <li class="comment-item" data-cid="...">
-        <div class="reply-doc">
-          <div class="bg-img-green"> <a href="...">用户名</a> </div>
-          <span class="pubtime">时间</span>
-          <p>评论内容</p>
-        </div>
-      </li>
-    </ul>
-    """
-    soup = BeautifulSoup(html, "lxml")
-    comments: list[Comment] = []
-    now_str = datetime.now().isoformat()
-
-    comment_items = soup.select("#comments .comment-item")
-    for item in comment_items:
-        try:
-            comment = _parse_comment_item(item, topic_id, now_str)
-            if comment:
-                comments.append(comment)
-        except Exception as exc:
-            logger.debug(f"解析评论失败: {exc}")
-            continue
-
-    logger.debug(f"从帖子 {topic_id} 解析到 {len(comments)} 条评论")
-    return comments
-
-
-def _parse_comment_item(item: Tag, topic_id: str, now_str: str) -> Comment | None:
-    """解析单条评论"""
-    comment_id = item.get("data-cid", "") or item.get("id", "")
-    if not comment_id:
-        return None
-
-    comment = Comment(
-        comment_id=str(comment_id),
-        topic_id=topic_id,
-        fetched_at=now_str,
-    )
-
-    # 作者
-    author_link = item.select_one(".reply-doc a") or item.select_one("a")
-    if author_link:
-        comment.author_name = author_link.get_text(strip=True)
-        comment.author_url = author_link.get("href", "")
-
-    # 评论时间
-    time_el = item.select_one(".pubtime") or item.select_one(".reply-doc span")
-    if time_el:
-        comment.created_time = time_el.get_text(strip=True)
-
-    # 评论内容
-    content_el = item.select_one(".reply-doc p") or item.select_one("p")
-    if content_el:
-        comment.content = content_el.get_text(strip=True)
-
-    # 赞数
-    vote_el = item.select_one(".comment-vote span") or item.select_one(".vote-count")
-    if vote_el:
-        comment.vote_count = _extract_number(vote_el.get_text(strip=True))
-
-    # 回复引用
-    reply_quote = item.select_one(".reply-quote")
-    if reply_quote:
-        ref_link = reply_quote.find("a")
-        if ref_link:
-            comment.reply_to = ref_link.get("data-cid", "")
-
-    return comment
-
-
 def parse_total_pages(html: str) -> int:
     """从讨论列表页解析总页数
 
@@ -275,20 +200,6 @@ def parse_total_pages(html: str) -> int:
             return max_page
 
     return 1
-
-
-def has_next_comment_page(html: str) -> str | None:
-    """检查是否有下一页评论，返回下一页 URL 或 None
-
-    评论分页: <div id="comments" ...> ... <span class="next"> <a href="?start=100">后页></a> </span>
-    """
-    soup = BeautifulSoup(html, "lxml")
-    next_link = soup.select_one("#comments .paginator .next a") or soup.select_one(
-        ".paginator .next a"
-    )
-    if next_link and next_link.get("href"):
-        return next_link["href"]
-    return None
 
 
 # ---------------------------------------------------------------------------
