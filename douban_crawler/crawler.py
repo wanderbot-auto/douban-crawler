@@ -186,6 +186,13 @@ class DoubanGroupCrawler:
 
                 detail = parse_topic_detail(html, topic.topic_id)
                 if detail:
+                    if not detail.content_html:
+                        logger.warning(
+                            "帖子 %s content_html 为空，跳过落库（页面解析失败或被反爬拦截）",
+                            topic.topic_id,
+                        )
+                        self.stats["errors"] += 1
+                        continue
                     self.storage.save_topic_detail(detail)
                     self.stats["details_fetched"] += 1
             except Exception as exc:

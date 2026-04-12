@@ -125,6 +125,13 @@ def parse_topic_detail(html: str, topic_id: str) -> TopicDetail | None:
 
     _check_blocked(soup)
 
+    # 正向结构校验：正常帖子页必须包含正文容器，缺失即视为无效页面
+    content_el = soup.select_one(".topic-richtext") or soup.select_one(".topic-content")
+    if not content_el:
+        reason = "嗯...错误页（内容已删除/无权访问）" if _is_douban_error_page(soup) else "页面缺少正文容器，可能被反爬拦截或结构异常"
+        logger.warning("帖子 %s 跳过解析：%s", topic_id, reason)
+        return None
+
     detail = TopicDetail(topic_id=topic_id, fetched_at=now_str)
 
     # 标题
@@ -133,14 +140,12 @@ def parse_topic_detail(html: str, topic_id: str) -> TopicDetail | None:
         detail.title = title_el.get_text(strip=True)
 
     # 正文
-    content_el = soup.select_one(".topic-richtext") or soup.select_one(".topic-content")
-    if content_el:
-        detail.content_html = str(content_el)
-        detail.content = content_el.get_text("\n", strip=True)
-        # 提取图片
-        detail.images = [
-            img.get("src", "") for img in content_el.find_all("img") if img.get("src")
-        ]
+    detail.content_html = str(content_el)
+    detail.content = content_el.get_text("\n", strip=True)
+    # 提取图片
+    detail.images = [
+        img.get("src", "") for img in content_el.find_all("img") if img.get("src")
+    ]
 
     # 作者信息
     from_el = soup.select_one(".topic-doc .from a")
@@ -227,6 +232,19 @@ def _check_blocked(soup: BeautifulSoup) -> None:
         logger.error("🚫 被豆瓣反爬机制拦截！建议：增大请求间隔 / 更换 IP / 设置登录 Cookie")
     elif "登录" in title and "豆瓣" in title:
         logger.warning("⚠️ 当前命中登录跳转页；优先连接已登录的 Chrome，必要时再补 DOUBAN_COOKIE")
+    elif _is_douban_error_page(soup):
+        logger.warning("⚠️ 命中豆瓣错误页（嗯...）：内容已删除、无权访问或链接失效")
+
+
+def _is_douban_error_page(soup: BeautifulSoup) -> bool:
+    """判断是否为豆瓣"嗯..."错误页（内容不存在/无权访问）"""
+    # 与 parse_topic_detail 保持一致，优先取 #content h1 而非页面第一个 h1
+    # （第一个 h1 通常是豆瓣 logo，文字为"豆瓣"而非错误标题）
+    h1_el = soup.select_one("#content h1") or soup.find("h1")
+    if h1_el and h1_el.get_text(strip=True).startswith("嗯"):
+        return True
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    return "嗯" in title
 
 
 def _detect_list_page_issue(soup: BeautifulSoup) -> str | None:
