@@ -1,4 +1,4 @@
-"""SQLite ??????"""
+"""SQLite storage layer."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_topics_group ON topics(group_id);
 
 
 class Storage:
-    """SQLite ?????"""
+    """SQLite-backed persistence."""
 
     def __init__(self, db_path: Path | str | None = None) -> None:
         self.db_path = str(db_path or DB_PATH)
@@ -57,7 +57,7 @@ class Storage:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             self._migrate(conn)
-        logger.info("??????: %s", self.db_path)
+        logger.info("???????: %s", self.db_path)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -104,7 +104,7 @@ class Storage:
         ]
         with self._connect() as conn:
             conn.executemany(sql, rows)
-        logger.info("?? %s ???????", len(rows))
+        logger.info("??? %s ???????", len(rows))
         return len(rows)
 
     def save_topic_detail(self, detail: TopicDetail) -> None:
@@ -141,9 +141,66 @@ class Storage:
                 cursor = conn.execute("SELECT topic_id FROM topics")
             return {row[0] for row in cursor.fetchall()}
 
-    def get_fetched_detail_ids(self) -> set[str]:
+    def get_pending_detail_topics(self, group_id: str, limit: int | None = None) -> list[Topic]:
+        sql = """
+            SELECT t.topic_id, t.title, t.url, t.author_name, t.author_url,
+                   t.reply_count, t.last_reply_time, t.group_id, t.created_at
+            FROM topics t
+            LEFT JOIN topic_details d ON d.topic_id = t.topic_id
+            WHERE t.group_id = ?
+              AND d.topic_id IS NULL
+              AND t.url != ''
+            ORDER BY COALESCE(t.created_at, ''), t.topic_id
+        """
+        params: list[object] = [group_id]
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+
         with self._connect() as conn:
-            cursor = conn.execute("SELECT topic_id FROM topic_details")
+            cursor = conn.execute(sql, tuple(params))
+            return [
+                Topic(
+                    topic_id=row[0],
+                    title=row[1],
+                    url=row[2],
+                    author_name=row[3] or "",
+                    author_url=row[4] or "",
+                    reply_count=row[5] or 0,
+                    last_reply_time=row[6] or "",
+                    group_id=row[7] or "",
+                    created_at=row[8] or "",
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def get_pending_detail_count(self, group_id: str) -> int:
+        sql = """
+            SELECT COUNT(*)
+            FROM topics t
+            LEFT JOIN topic_details d ON d.topic_id = t.topic_id
+            WHERE t.group_id = ?
+              AND d.topic_id IS NULL
+              AND t.url != ''
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(sql, (group_id,))
+            return cursor.fetchone()[0]
+
+    def get_fetched_detail_ids(self, group_id: str | None = None) -> set[str]:
+        with self._connect() as conn:
+            if group_id:
+                cursor = conn.execute(
+                    """
+                    SELECT d.topic_id
+                    FROM topic_details d
+                    INNER JOIN topics t ON t.topic_id = d.topic_id
+                    WHERE t.group_id = ?
+                    """,
+                    (group_id,),
+                )
+            else:
+                cursor = conn.execute("SELECT topic_id FROM topic_details")
             return {row[0] for row in cursor.fetchall()}
 
     def get_topic_count(self, group_id: str | None = None) -> int:
@@ -154,7 +211,18 @@ class Storage:
                 cursor = conn.execute("SELECT COUNT(*) FROM topics")
             return cursor.fetchone()[0]
 
-    def get_detail_count(self) -> int:
+    def get_detail_count(self, group_id: str | None = None) -> int:
         with self._connect() as conn:
-            cursor = conn.execute("SELECT COUNT(*) FROM topic_details")
+            if group_id:
+                cursor = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM topic_details d
+                    INNER JOIN topics t ON t.topic_id = d.topic_id
+                    WHERE t.group_id = ?
+                    """,
+                    (group_id,),
+                )
+            else:
+                cursor = conn.execute("SELECT COUNT(*) FROM topic_details")
             return cursor.fetchone()[0]

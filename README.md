@@ -22,8 +22,11 @@ douban-crawler crawl --skip-pages 100 --pages 20
 # 指定小组
 douban-crawler crawl --group 12345 --pages 3
 
-# 仅抓列表，不抓详情
-douban-crawler crawl --pages 5 --no-details
+# List only
+douban-crawler crawl --service list --pages 5
+
+# Backfill missing details from topics table
+douban-crawler crawl --service detail
 
 # 查看统计
 douban-crawler stats

@@ -629,14 +629,74 @@ class Storage:
         with self._conn() as c:
             return {r[0] for r in c.execute("SELECT topic_id FROM topics WHERE group_id=?", (group_id,))}
 
-    def get_fetched_detail_ids(self) -> set[str]:
+    def get_pending_detail_topics(self, group_id: str) -> list[Topic]:
         with self._conn() as c:
-            return {r[0] for r in c.execute("SELECT topic_id FROM topic_details")}
+            rows = c.execute(
+                """
+                SELECT t.topic_id, t.title, t.url, t.author_name, t.author_url,
+                       t.reply_count, t.last_reply_time, t.group_id, t.tab_id, t.created_at
+                FROM topics t
+                LEFT JOIN topic_details d ON d.topic_id = t.topic_id
+                WHERE t.group_id = ?
+                  AND d.topic_id IS NULL
+                  AND t.url != ''
+                ORDER BY COALESCE(t.created_at, ''), t.topic_id
+                """,
+                (group_id,),
+            ).fetchall()
+        return [
+            Topic(
+                topic_id=row[0], title=row[1], url=row[2], author_name=row[3] or "",
+                author_url=row[4] or "", reply_count=row[5] or 0, last_reply_time=row[6] or "",
+                group_id=row[7] or "", tab_id=row[8] or "", created_at=row[9] or "",
+            )
+            for row in rows
+        ]
+
+    def get_fetched_detail_ids(self, group_id: str | None = None) -> set[str]:
+        with self._conn() as c:
+            if group_id:
+                rows = c.execute(
+                    """
+                    SELECT d.topic_id
+                    FROM topic_details d
+                    INNER JOIN topics t ON t.topic_id = d.topic_id
+                    WHERE t.group_id = ?
+                    """,
+                    (group_id,),
+                )
+            else:
+                rows = c.execute("SELECT topic_id FROM topic_details")
+            return {r[0] for r in rows}
+
+    def count_pending_details(self, group_id: str) -> int:
+        with self._conn() as c:
+            return c.execute(
+                """
+                SELECT COUNT(*)
+                FROM topics t
+                LEFT JOIN topic_details d ON d.topic_id = t.topic_id
+                WHERE t.group_id = ?
+                  AND d.topic_id IS NULL
+                  AND t.url != ''
+                """,
+                (group_id,),
+            ).fetchone()[0]
 
     def count(self, table: str, group_id: str | None = None) -> int:
         with self._conn() as c:
             if group_id and table == "topics":
                 return c.execute(f"SELECT COUNT(*) FROM {table} WHERE group_id=?", (group_id,)).fetchone()[0]
+            if group_id and table == "topic_details":
+                return c.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM topic_details d
+                    INNER JOIN topics t ON t.topic_id = d.topic_id
+                    WHERE t.group_id = ?
+                    """,
+                    (group_id,),
+                ).fetchone()[0]
             return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
@@ -650,7 +710,7 @@ class DoubanGroupCrawler:
         self, group_id: str = DEFAULT_GROUP, tab_id: str = "",
         storage: Storage | None = None,
         max_pages: int = 0, skip_pages: int = 0,
-        fetch_details: bool = False,
+        service: str = "list",
         fetch_backend: str = FETCH_BACKEND,
         fetcher_factory: Callable[[str], HttpPageFetcher] | None = None,
     ) -> None:
@@ -659,14 +719,14 @@ class DoubanGroupCrawler:
         self.storage = storage or Storage()
         self.max_pages = max_pages
         self.skip_pages = skip_pages
-        self.fetch_details = fetch_details
+        self.service = service
         self.fetch_backend = fetch_backend
         self._fetcher_factory = fetcher_factory or create_page_fetcher
         self._fetcher = self._fetcher_factory(fetch_backend)
         self._limiter = RateLimiter()
         self.stats: dict[str, int] = {
             "pages_fetched": 0, "pages_skipped": 0, "topics_found": 0, "topics_new": 0,
-            "topics_updated": 0, "details_fetched": 0,
+            "topics_updated": 0, "details_skipped": 0, "details_fetched": 0,
             "errors": 0,
         }
 
@@ -674,17 +734,19 @@ class DoubanGroupCrawler:
 
     def run(self) -> dict[str, int]:
         tab_info = f" tab={self.tab_id}" if self.tab_id else ""
-        logger.info(f"开始爬取小组 {self.group_id}{tab_info}")
-        logger.info(f"页面访问后端: {self.fetch_backend}")
-        logger.info(f"页数配置: max_pages={self.max_pages or '全部'}, skip_pages={self.skip_pages}")
+        logger.info(f"?????? {self.group_id}{tab_info}")
+        logger.info(f"??????: {self.fetch_backend}")
+        logger.info(f"service mode: {self.service}")
+        logger.info(f"????: max_pages={self.max_pages or '??'}, skip_pages={self.skip_pages}")
         try:
-            topics = self._crawl_list()
-            if self.fetch_details and topics:
-                self._crawl_details(topics)
+            if self.service == "list":
+                self._crawl_list()
+            else:
+                self._crawl_details()
         except KeyboardInterrupt:
-            logger.warning("用户中断")
+            logger.warning("????")
         except Exception as exc:
-            logger.error(f"爬取异常: {exc}", exc_info=True)
+            logger.error(f"????: {exc}", exc_info=True)
             self.stats["errors"] += 1
         finally:
             self._fetcher.close()
@@ -801,21 +863,20 @@ class DoubanGroupCrawler:
 
     # -- 详情爬取 --
 
-    def _crawl_details(self, topics: list[Topic]) -> None:
-        done = self.storage.get_fetched_detail_ids()
-        pending = [t for t in topics if t.topic_id not in done]
-        logger.info(f"待爬详情: {len(pending)} 个（跳过 {len(topics) - len(pending)} 个）")
+    def _crawl_details(self) -> None:
+        pending = self.storage.get_pending_detail_topics(self.group_id)
+        self.stats["details_skipped"] = self.storage.count("topic_details", self.group_id)
+        logger.info(f"pending details: {len(pending)} (existing={self.stats['details_skipped']})")
 
         for i, t in enumerate(pending, 1):
             logger.info(f"[{i}/{len(pending)}] {t.title[:40]}")
-            page_html = self._fetch_page(t.url)
+            page_html = self._fetch_page(t.url, referer=f"{DOUBAN_BASE}/group/{self.group_id}/")
             if not page_html:
                 self.stats["errors"] += 1
                 continue
 
             detail = parse_topic_detail(page_html, t.topic_id)
-            if detail:
-                self.storage.save_detail(detail)
+            if detail and self.storage.save_detail(detail):
                 self.stats["details_fetched"] += 1
 
 
@@ -846,7 +907,8 @@ def print_stats(group_id: str) -> None:
     print(f"  数据库统计 — 小组 {group_id}")
     print(f"{'=' * 42}")
     print(f"  帖子(列表):  {s.count('topics', group_id)}")
-    print(f"  帖子(详情):  {s.count('topic_details')}")
+    print(f"  Details:     {s.count('topic_details', group_id)}")
+    print(f"  Pending:     {s.count_pending_details(group_id)}")
     print(f"  数据库路径:  {DB_PATH}")
     print(f"{'=' * 42}\n")
 
@@ -901,7 +963,7 @@ def main() -> None:
     ap.add_argument("-t", "--tab", default=DEFAULT_TAB, help=f"Tab ID（默认 {DEFAULT_TAB}，留空则爬 /discussion）")
     ap.add_argument("-p", "--pages", type=int, default=3, help="最大页数，0=全部（默认 3）")
     ap.add_argument("--skip-pages", type=int, default=0, help="跳过前 N 页后再开始爬取（默认 0）")
-    ap.add_argument("--details", action="store_true", help="Fetch topic details")
+    ap.add_argument("--service", choices=["list", "detail"], default="list", help="service mode: list/detail")
     ap.add_argument("--stats", action="store_true", help="查看数据库统计")
     ap.add_argument("--export", choices=["csv", "json"], help="导出数据")
     ap.add_argument("-o", "--output", help="导出文件路径")
@@ -924,7 +986,6 @@ def main() -> None:
         return
 
     tab_id = args.tab.strip()
-    wants_details = args.details
     target_url = f"https://www.douban.com/group/{args.group}/"
     if tab_id:
         target_url += f"?tab={tab_id}"
@@ -934,9 +995,9 @@ def main() -> None:
     print(f"{'=' * 48}")
     print(f"  目标: {target_url}")
     print("  后端: http")
+    print(f"  Service: {args.service}")
     print(f"  页数: {'不限' if args.pages == 0 else args.pages}")
     print(f"  跳过页数: {args.skip_pages}")
-    print(f"  详情: {'是' if wants_details else '否'}")
     print("  图片: 仅保存链接")
     print("  去重: 自动（数据变化时更新）")
     print(f"{'=' * 48}\n")
@@ -946,7 +1007,7 @@ def main() -> None:
         tab_id=tab_id,
         max_pages=args.pages,
         skip_pages=args.skip_pages,
-        fetch_details=wants_details,
+        service=args.service,
     )
     stats = crawler.run()
 
@@ -959,6 +1020,7 @@ def main() -> None:
         ("topics_found", "发现帖子"),
         ("topics_new", "新增帖子"),
         ("topics_updated", "更新帖子"),
+        ("details_skipped", "Existing"),
         ("details_fetched", "详情"),
         ("errors", "错误"),
     ]:

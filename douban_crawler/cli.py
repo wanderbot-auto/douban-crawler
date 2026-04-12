@@ -1,4 +1,4 @@
-"""??????"""
+"""Command line interface."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ console = Console()
 
 
 def setup_logging(level: str = LOG_LEVEL) -> None:
-    """?? Rich ???"""
+    """Configure Rich logging."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(message)s",
@@ -29,30 +29,40 @@ def setup_logging(level: str = LOG_LEVEL) -> None:
 @click.group()
 @click.option("--debug", is_flag=True, help="??????")
 def main(debug: bool) -> None:
-    """???????????"""
+    """?????????"""
     setup_logging("DEBUG" if debug else LOG_LEVEL)
 
 
 @main.command()
 @click.option("--group", "-g", default=DEFAULT_GROUP_ID, help="?? ID")
-@click.option("--pages", "-p", default=0, type=int, help="???????0=???")
-@click.option("--skip-pages", default=0, type=click.IntRange(min=0), help="??? N ???????")
-@click.option("--no-details", is_flag=True, help="???????")
-def crawl(group: str, pages: int, skip_pages: int, no_details: bool) -> None:
+@click.option("--pages", "-p", default=0, type=int, help="???????0=??")
+@click.option("--skip-pages", default=0, type=click.IntRange(min=0), help="??? N ????")
+@click.option(
+    "--service",
+    type=click.Choice(["list", "detail"], case_sensitive=False),
+    default="list",
+    show_default=True,
+    help="list ??????detail ?? topics ?????",
+)
+def crawl(group: str, pages: int, skip_pages: int, service: str) -> None:
     """?????????"""
-    console.print(f"[bold green]????????[/bold green] [cyan]{group}[/cyan]")
+    service = service.lower()
+
+    console.print(f"[bold green]????[/bold green] [cyan]{group}[/cyan]")
     console.print(f"  ??: https://www.douban.com/group/{group}/")
-    console.print(f"  ????: {'??' if pages == 0 else pages}")
-    console.print(f"  ????: {skip_pages}")
-    console.print(f"  ????: {'?' if no_details else '?'}")
-    console.print("  ????: http")
+    console.print(f"  ??: {service}")
+    console.print(f"  ??: {'??' if pages == 0 else pages}")
+    console.print(f"  ??: {skip_pages}")
+    console.print("  ??: http")
+    if service == "detail" and (pages > 0 or skip_pages > 0):
+        console.print("[yellow]detail ????? --pages ? --skip-pages???? topics ???????[/yellow]")
     console.print()
 
     crawler = DoubanGroupCrawler(
         group_id=group,
         max_pages=pages,
         skip_pages=skip_pages,
-        fetch_details=not no_details,
+        service=service,
     )
     stats = crawler.run()
 
@@ -64,6 +74,7 @@ def crawl(group: str, pages: int, skip_pages: int, no_details: bool) -> None:
     table.add_row("????", str(stats["pages_skipped"]))
     table.add_row("????", str(stats["topics_found"]))
     table.add_row("????", str(stats["topics_new"]))
+    table.add_row("????", str(stats["details_skipped"]))
     table.add_row("????", str(stats["details_fetched"]))
     table.add_row("????", str(stats["errors"]))
     console.print(table)
@@ -75,11 +86,12 @@ def stats(group: str) -> None:
     """??????????"""
     storage = Storage()
 
-    table = Table(title=f"???????? {group}?", show_header=True, header_style="bold magenta")
-    table.add_column("????", style="cyan")
+    table = Table(title=f"?????: {group}", show_header=True, header_style="bold magenta")
+    table.add_column("???", style="cyan")
     table.add_column("??", justify="right", style="green")
     table.add_row("??(??)", str(storage.get_topic_count(group)))
-    table.add_row("??(??)", str(storage.get_detail_count()))
+    table.add_row("??(??)", str(storage.get_detail_count(group)))
+    table.add_row("????", str(storage.get_pending_detail_count(group)))
     console.print(table)
 
 
@@ -88,7 +100,7 @@ def stats(group: str) -> None:
 @click.option("--format", "-f", "fmt", type=click.Choice(["csv", "json"]), default="csv", help="????")
 @click.option("--output", "-o", default=None, help="??????")
 def export(group: str, fmt: str, output: str | None) -> None:
-    """?????"""
+    """???????"""
     import csv
     import json
     import sqlite3
@@ -113,7 +125,7 @@ def export(group: str, fmt: str, output: str | None) -> None:
     conn.close()
 
     if not rows:
-        console.print("[yellow]???????[/yellow]")
+        console.print("[yellow]????????[/yellow]")
         return
 
     output_path = output or f"data/export_{group}.{fmt}"

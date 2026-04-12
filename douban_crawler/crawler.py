@@ -1,9 +1,9 @@
-"""????????????????????"""
+"""Crawler orchestration."""
 
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Literal
 
 from douban_crawler.anti_crawl import RateLimiter
 from douban_crawler.config import DOUBAN_BASE_URL, DEFAULT_GROUP_ID, FETCH_BACKEND, TOPICS_PER_PAGE
@@ -19,9 +19,11 @@ from douban_crawler.storage import Storage
 
 logger = logging.getLogger(__name__)
 
+ServiceName = Literal["list", "detail"]
+
 
 class DoubanGroupCrawler:
-    """???????"""
+    """Douban group crawler."""
 
     def __init__(
         self,
@@ -29,7 +31,7 @@ class DoubanGroupCrawler:
         storage: Storage | None = None,
         max_pages: int = 0,
         skip_pages: int = 0,
-        fetch_details: bool = True,
+        service: ServiceName = "list",
         fetch_backend: str = FETCH_BACKEND,
         fetcher_factory: Callable[[str], PageFetcher] | None = None,
     ) -> None:
@@ -37,7 +39,7 @@ class DoubanGroupCrawler:
         self.storage = storage or Storage()
         self.max_pages = max_pages
         self.skip_pages = skip_pages
-        self.fetch_details = fetch_details
+        self.service = service
         self.fetch_backend = fetch_backend
         self._fetcher_factory = fetcher_factory or create_page_fetcher
 
@@ -49,24 +51,26 @@ class DoubanGroupCrawler:
             "topics_found": 0,
             "topics_new": 0,
             "details_fetched": 0,
+            "details_skipped": 0,
             "errors": 0,
         }
 
     def run(self) -> dict:
-        logger.info("?????? %s ?????", self.group_id)
+        logger.info("?????? %s", self.group_id)
         logger.info(
-            "??: backend=%s, max_pages=%s, skip_pages=%s, fetch_details=%s",
+            "??: service=%s, backend=%s, max_pages=%s, skip_pages=%s",
+            self.service,
             self.fetch_backend,
             self.max_pages or "??",
             self.skip_pages,
-            self.fetch_details,
         )
 
         try:
             self._fetcher = self._fetcher_factory(self.fetch_backend)
-            all_topics = self._crawl_topic_list()
-            if self.fetch_details and all_topics:
-                self._crawl_topic_details(all_topics)
+            if self.service == "list":
+                self._crawl_topic_list()
+            else:
+                self._crawl_topic_details()
         except KeyboardInterrupt:
             logger.warning("??????")
         except Exception as exc:
@@ -79,59 +83,63 @@ class DoubanGroupCrawler:
         self._log_stats()
         return self.stats
 
-    def _crawl_topic_list(self) -> list[Topic]:
-        all_topics: list[Topic] = []
+    def _crawl_topic_list(self) -> None:
         existing_ids = self.storage.get_topic_ids(self.group_id)
-        logger.info("?????? %s ?????", len(existing_ids))
+        logger.info("???????? %s ???", len(existing_ids))
 
         first_page_html = self._fetch_discussion_page(start=0)
         if not first_page_html:
-            logger.error("????????????")
-            return all_topics
+            logger.error("??????????")
+            return
 
         try:
             total_pages = parse_total_pages(first_page_html)
         except ListPageUnavailableError as exc:
-            logger.error("??????????????%s", exc)
+            logger.error("??????????????: %s", exc)
             self.stats["errors"] += 1
-            return all_topics
+            return
 
         start_page = self.skip_pages + 1
         if start_page > total_pages:
             self.stats["pages_skipped"] = total_pages
-            logger.warning("???? %s ????? %s ???????????", self.skip_pages, total_pages)
-            return all_topics
+            logger.warning("???? %s ????? %s????????", self.skip_pages, total_pages)
+            return
 
         end_page = total_pages
         if self.max_pages > 0:
             end_page = min(total_pages, self.skip_pages + self.max_pages)
 
         self.stats["pages_skipped"] = start_page - 1
-        logger.info("? %s ???? %s ??????? %s ?? %s ?", total_pages, self.stats["pages_skipped"], start_page, end_page)
+        logger.info(
+            "? %s ???? %s ?????? %s ? %s ?",
+            total_pages,
+            self.stats["pages_skipped"],
+            start_page,
+            end_page,
+        )
 
         if start_page == 1:
             current_page_html = first_page_html
         else:
             start = (start_page - 1) * TOPICS_PER_PAGE
-            logger.info("????? %s/%s ?(start=%s)", start_page, total_pages, start)
+            logger.info("??? %s/%s ? (start=%s)", start_page, total_pages, start)
             current_page_html = self._fetch_discussion_page(start=start)
             if not current_page_html:
-                logger.error("??????? %s???????", start_page)
+                logger.error("? %s ?????", start_page)
                 self.stats["errors"] += 1
-                return all_topics
+                return
 
         topics = parse_topic_list(current_page_html, self.group_id)
         if not topics:
-            logger.warning("? %s ??????????????", start_page)
-            return all_topics
+            logger.warning("? %s ?????????", start_page)
+            return
 
-        new_topics = self._save_new_topics(topics, existing_ids)
-        all_topics.extend(new_topics)
+        self._save_new_topics(topics, existing_ids)
         self.stats["pages_fetched"] += 1
 
         for page in range(start_page + 1, end_page + 1):
             start = (page - 1) * TOPICS_PER_PAGE
-            logger.info("????? %s/%s ?(start=%s)", page, total_pages, start)
+            logger.info("??? %s/%s ? (start=%s)", page, total_pages, start)
 
             html = self._fetch_discussion_page(start=start)
             if not html:
@@ -140,17 +148,15 @@ class DoubanGroupCrawler:
 
             topics = parse_topic_list(html, self.group_id)
             if not topics:
-                logger.warning("? %s ??????????????", page)
+                logger.warning("? %s ?????????", page)
                 break
 
-            new_topics = self._save_new_topics(topics, existing_ids)
-            all_topics.extend(new_topics)
+            self._save_new_topics(topics, existing_ids)
             self.stats["pages_fetched"] += 1
 
-        logger.info("??????: ? %s ???, ?? %s ?", self.stats["topics_found"], self.stats["topics_new"])
-        return all_topics
+        logger.info("??????: ?? %s ???? %s ?", self.stats["topics_found"], self.stats["topics_new"])
 
-    def _save_new_topics(self, topics: list[Topic], existing_ids: set[str]) -> list[Topic]:
+    def _save_new_topics(self, topics: list[Topic], existing_ids: set[str]) -> None:
         self.stats["topics_found"] += len(topics)
         self.storage.save_topics(topics)
 
@@ -158,18 +164,22 @@ class DoubanGroupCrawler:
         self.stats["topics_new"] += len(new_topics)
         for topic in topics:
             existing_ids.add(topic.topic_id)
-        return new_topics
 
-    def _crawl_topic_details(self, topics: list[Topic]) -> None:
-        fetched_detail_ids = self.storage.get_fetched_detail_ids()
-        pending = [topic for topic in topics if topic.topic_id not in fetched_detail_ids]
-        logger.info("????? %s ????????? %s ??", len(pending), len(topics) - len(pending))
+    def _crawl_topic_details(self) -> None:
+        pending = self.storage.get_pending_detail_topics(self.group_id)
+        self.stats["details_skipped"] = self.storage.get_detail_count(self.group_id)
+
+        if not pending:
+            logger.info("topics ????????????")
+            return
+
+        logger.info("???? %s ??????? %s ?", len(pending), self.stats["details_skipped"])
 
         for index, topic in enumerate(pending, 1):
             logger.info("[%s/%s] ????: %s", index, len(pending), topic.title[:40])
 
             try:
-                html = self._fetch_page(topic.url)
+                html = self._fetch_page(topic.url, referer=f"{DOUBAN_BASE_URL}/group/{self.group_id}/")
                 if not html:
                     self.stats["errors"] += 1
                     continue
@@ -197,16 +207,17 @@ class DoubanGroupCrawler:
 
     def _require_fetcher(self) -> PageFetcher:
         if not self._fetcher:
-            raise RuntimeError("??????????")
+            raise RuntimeError("fetcher ?????")
         return self._fetcher
 
     def _log_stats(self) -> None:
         logger.info("=" * 50)
-        logger.info("????:")
+        logger.info("??:")
         logger.info("  ????: %s ?", self.stats["pages_fetched"])
         logger.info("  ????: %s ?", self.stats["pages_skipped"])
         logger.info("  ????: %s ?", self.stats["topics_found"])
         logger.info("  ????: %s ?", self.stats["topics_new"])
+        logger.info("  ????: %s ?", self.stats["details_skipped"])
         logger.info("  ????: %s ?", self.stats["details_fetched"])
         logger.info("  ????: %s ?", self.stats["errors"])
         logger.info("=" * 50)
